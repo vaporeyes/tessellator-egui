@@ -374,6 +374,7 @@ struct TessellatorApp {
     
     // Pending high-res image to be uploaded to GPU
     pending_high_res: Option<Arc<image::DynamicImage>>,
+    current_image_size: Option<[u32; 2]>,
 }
 
 impl TessellatorApp {
@@ -396,6 +397,7 @@ impl TessellatorApp {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             pending_high_res: None,
+            current_image_size: None,
         }
     }
 
@@ -504,14 +506,14 @@ impl eframe::App for TessellatorApp {
                 }
                 Message::HighResLoaded { image, .. } => {
                     println!("High-res image loaded, triggering GPU upload");
+                    self.current_image_size = Some([image.width(), image.height()]);
                     let mut renderer = self.wgpu_state.renderer.write();
                     if let Some(tess_resources) = renderer.callback_resources.get_mut::<TessellatorResources>() {
                         tess_resources.update_texture(&self.wgpu_state.device, &self.wgpu_state.queue, &image);
                     } else {
-                        // If resources don't exist yet, we'll store them for the first paint to handle.
                         self.pending_high_res = Some(image);
                     }
-                    self.zoom = 1.0;
+                    self.zoom = -1.0; // Magic value for "trigger fit to screen on next update"
                     self.pan = egui::Vec2::ZERO;
                     ctx.request_repaint();
                 }
@@ -586,41 +588,79 @@ impl eframe::App for TessellatorApp {
                 let rect = ui.max_rect();
                 let response = ui.interact(rect, ui.id(), egui::Sense::drag());
 
-                // Zoom & Pan
-                if response.dragged() {
-                    self.pan += response.drag_delta() / (rect.size() * 0.5 * self.zoom);
+                if let Some([img_w, img_h]) = self.current_image_size {
+                    let img_w = img_w as f32;
+                    let img_h = img_h as f32;
+                    let screen_w = rect.width();
+                    let screen_h = rect.height();
+
+                    // Initial fit-to-screen
+                    if self.zoom < 0.0 {
+                        self.zoom = (screen_w / img_w).min(screen_h / img_h);
+                    }
+
+                    // Zoom & Pan
+                    let mut zoom_factor = 1.0;
+                    let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll_delta != 0.0 {
+                        zoom_factor = (scroll_delta * 0.01).exp();
+                    }
+
+                    if zoom_factor != 1.0 {
+                        if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                            if rect.contains(mouse_pos) {
+                                // Convert mouse to NDC [-1, 1]
+                                let mouse_ndc = egui::vec2(
+                                    (mouse_pos.x - rect.center().x) / (rect.width() * 0.5),
+                                    (mouse_pos.y - rect.center().y) / (rect.height() * 0.5),
+                                );
+
+                                // To zoom into the mouse:
+                                // Pan_new = Mouse_ndc + (Pan_old - Mouse_ndc) * zoom_factor
+                                self.pan = mouse_ndc + (self.pan - mouse_ndc) * zoom_factor;
+                                self.zoom *= zoom_factor;
+                            } else {
+                                self.zoom *= zoom_factor;
+                            }
+                        } else {
+                            self.zoom *= zoom_factor;
+                        }
+                    }
+
+                    if response.dragged() {
+                        self.pan += response.drag_delta() / (rect.size() * 0.5);
+                    }
+
+                    // Prepare matrix: scale * translate
+                    // NDC Scale = (Image Dimension * zoom) / Screen Dimension
+                    let scale_x = (img_w * self.zoom) / screen_w;
+                    let scale_y = (img_h * self.zoom) / screen_h;
+
+                    let mut matrix = [0.0f32; 12];
+                    matrix[0] = scale_x;   
+                    matrix[5] = scale_y;   
+                    matrix[8] = self.pan.x; 
+                    matrix[9] = -self.pan.y; // NDC Y is up
+                    matrix[10] = 1.0;        
+
+                    let settings = ShaderSettings {
+                        view_matrix: matrix,
+                        grayscale: self.grayscale,
+                        grid_opacity: self.grid_opacity,
+                        grid_size: self.grid_size,
+                        padding: 0.0,
+                    };
+
+                    let callback = egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        TessellatorCallback {
+                            image: self.pending_high_res.take(),
+                            settings,
+                            format: self.wgpu_state.target_format,
+                        },
+                    );
+                    ui.painter().with_clip_rect(rect).add(callback);
                 }
-                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll_delta != 0.0 {
-                    self.zoom *= (scroll_delta * 0.01).exp();
-                }
-
-                // Prepare matrix: scale * translate
-                // Column-major mat3x3 (48 bytes)
-                let mut matrix = [0.0f32; 12];
-                matrix[0] = self.zoom;   // Col 0, X
-                matrix[5] = self.zoom;   // Col 1, Y
-                matrix[8] = self.pan.x * self.zoom; // Col 2, X
-                matrix[9] = -self.pan.y * self.zoom; // Col 2, Y (NDC Y is up)
-                matrix[10] = 1.0;        // Col 2, Z
-
-                let settings = ShaderSettings {
-                    view_matrix: matrix,
-                    grayscale: self.grayscale,
-                    grid_opacity: self.grid_opacity,
-                    grid_size: self.grid_size,
-                    padding: 0.0,
-                };
-
-                let callback = egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    TessellatorCallback {
-                        image: self.pending_high_res.take(),
-                        settings,
-                        format: self.wgpu_state.target_format,
-                    },
-                );
-                ui.painter().with_clip_rect(rect).add(callback);
             } else {
                 ui.heading("Viewer");
                 ui.label("Select an image to view.");
