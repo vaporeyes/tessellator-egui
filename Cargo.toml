@@ -1,0 +1,18 @@
+[package]
+name = "tessellator-egui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.31.0", features = ["wgpu"] }
+egui = "0.31.0"
+egui-wgpu = "0.31.0"
+wgpu = "24.0.1"
+image = "0.25.5"
+walkdir = "2.5.0"
+rfd = "0.15.2"
+crossbeam-channel = "0.5.14"
+rayon = "1.10.0"
+bytemuck = { version = "1.21.0", features = ["derive"] }
+log = "0.4.26"
+env_logger = "0.11.6"
