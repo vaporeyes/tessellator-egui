@@ -10,7 +10,26 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wide::u32x8;
+
+/// Cooperative cancellation handle shared between the app (which decides to
+/// cancel) and the rayon worker (which polls at known checkpoints). Cheap to
+/// clone; under the hood is an `Arc<AtomicBool>`.
+#[derive(Clone, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 /// Files smaller than this don't benefit from mmap (page-table overhead and
 /// minimum mapping size dominate). Read into a Vec instead.
@@ -206,9 +225,32 @@ fn decode_image(path: &Path) -> image::ImageResult<DynamicImage> {
 
 /// Decode + EXIF rotate + RGBA convert + full mip chain. All heavy CPU work is
 /// concentrated here so the render thread sees only `write_texture` calls.
-fn decode_image_with_mips(path: &Path) -> image::ImageResult<DecodedImage> {
+/// Errors a decode worker can produce. `Cancelled` is informational only -
+/// the app removes its pending entry at cancel time, so cancelled workers
+/// silently return without sending any message.
+enum DecodeError {
+    Image(image::ImageError),
+    Cancelled,
+}
+
+impl From<image::ImageError> for DecodeError {
+    fn from(e: image::ImageError) -> Self {
+        DecodeError::Image(e)
+    }
+}
+
+fn decode_image_with_mips(
+    path: &Path,
+    cancel: &CancelToken,
+) -> Result<DecodedImage, DecodeError> {
     let img = decode_image(path)?;
+    if cancel.is_cancelled() {
+        return Err(DecodeError::Cancelled);
+    }
     let rgba = to_rgba8_consuming(img);
+    if cancel.is_cancelled() {
+        return Err(DecodeError::Cancelled);
+    }
     let (width, height) = rgba.dimensions();
     let max_dim = width.max(height).max(1);
     let level_count = max_dim.ilog2() + 1;
@@ -216,6 +258,9 @@ fn decode_image_with_mips(path: &Path) -> image::ImageResult<DecodedImage> {
     let mut mips = Vec::with_capacity(level_count as usize);
     mips.push(MipLevel { width, height, rgba: rgba.into_raw() });
     for _ in 1..level_count {
+        if cancel.is_cancelled() {
+            return Err(DecodeError::Cancelled);
+        }
         let prev = mips.last().unwrap();
         mips.push(downsample_box(&prev.rgba, prev.width, prev.height));
     }
@@ -479,32 +524,50 @@ fn decode_thumbnail(path: &Path) -> Option<DynamicImage> {
 pub fn request_image(
     path: PathBuf,
     purpose: ImagePurpose,
+    cancel: CancelToken,
     sender: Sender<Message>,
     ctx: egui::Context,
 ) {
     rayon::spawn(move || {
+        // Cancelled while queued (rare but possible under heavy traversal).
+        if cancel.is_cancelled() {
+            log::debug!(
+                "Decode pre-cancelled ({:?}): {:?}",
+                purpose,
+                path.file_name().unwrap_or_default()
+            );
+            return;
+        }
         log::debug!(
             "Image decode start ({:?}): {:?}",
             purpose,
             path.file_name().unwrap_or_default()
         );
-        match decode_image_with_mips(&path) {
+        match decode_image_with_mips(&path, &cancel) {
             Ok(img) => {
                 let _ = sender.send(Message::ImageDecoded {
                     path,
                     image: Arc::new(img),
                     purpose,
                 });
+                ctx.request_repaint();
             }
-            Err(e) => {
+            Err(DecodeError::Image(e)) => {
                 log::error!("Image decode failed for {:?}: {}", path, e);
                 let _ = sender.send(Message::ImageFailed {
                     path,
                     error: e.to_string(),
                     purpose,
                 });
+                ctx.request_repaint();
+            }
+            Err(DecodeError::Cancelled) => {
+                log::debug!(
+                    "Decode cancelled mid-flight ({:?}): {:?}",
+                    purpose,
+                    path.file_name().unwrap_or_default()
+                );
             }
         }
-        ctx.request_repaint();
     });
 }

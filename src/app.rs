@@ -4,8 +4,8 @@
 use eframe::egui;
 use eframe::wgpu;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::cache::ImageCache;
 use crate::gpu::{CompareUpload, ShaderSettings, TessellatorCallback};
-use crate::io::{self, DecodedImage, ImagePurpose, Message};
+use crate::io::{self, CancelToken, DecodedImage, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
 use crate::watcher::FolderWatcher;
 
@@ -82,10 +82,17 @@ pub struct TessellatorApp {
     /// outcome. Prevents repeated retries of broken files.
     requested_thumbnails: HashSet<PathBuf>,
 
-    /// Paths with a high-res decode currently in flight. Used to avoid
-    /// duplicate Preload requests; Display requests are issued unconditionally
-    /// and disambiguated by generation.
-    pending_image_requests: HashSet<PathBuf>,
+    /// Paths with a high-res decode currently in flight, mapped to a
+    /// cancellation handle. Used to avoid duplicate work and to abort decodes
+    /// the user has navigated past.
+    pending_image_requests: HashMap<PathBuf, CancelToken>,
+
+    /// Wall-clock of the last `select_image` call, for direction tracking.
+    last_select_time: Option<Instant>,
+    /// Signed counter of consecutive same-direction selections within the
+    /// debounce window. Positive = forward streak, negative = backward,
+    /// zero = stationary or recently paused.
+    direction_streak: i32,
 
     /// Decoded images cached for instant re-display on neighbor navigation.
     image_cache: ImageCache,
@@ -185,7 +192,9 @@ impl TessellatorApp {
             receiver,
             sender,
             requested_thumbnails: HashSet::new(),
-            pending_image_requests: HashSet::new(),
+            pending_image_requests: HashMap::new(),
+            last_select_time: None,
+            direction_streak: 0,
             image_cache: ImageCache::new(CACHE_CAP_BYTES),
             high_res_generation: 0,
             last_load_error: None,
@@ -229,7 +238,9 @@ impl TessellatorApp {
         self.files.clear();
         self.selected_index = None;
         self.requested_thumbnails.clear();
-        self.pending_image_requests.clear();
+        self.cancel_all_image_requests();
+        self.last_select_time = None;
+        self.direction_streak = 0;
         self.current_image_size = None;
         self.current_image = None;
         self.needs_upload = false;
@@ -257,6 +268,12 @@ impl TessellatorApp {
     }
 
     fn start_compare(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // Cancel a prior compare-target if it differs from the new pick.
+        if let Some(prev) = self.compare_path.take()
+            && prev != path
+        {
+            self.cancel_image_request(&prev);
+        }
         self.compare_generation = self.compare_generation.wrapping_add(1);
         self.compare_path = Some(path.clone());
         if let Some(image) = self.image_cache.get(&path) {
@@ -265,24 +282,58 @@ impl TessellatorApp {
         } else {
             self.compare_image = None;
             self.compare_dirty = true;
-            self.pending_image_requests.insert(path.clone());
-            io::request_image(
+            // Cancel any prior in-flight request for this same path so we get
+            // fresh work tagged with the current Compare generation.
+            self.cancel_image_request(&path);
+            self.dispatch_image_request(
                 path,
                 ImagePurpose::Compare { generation: self.compare_generation },
-                self.sender.clone(),
-                ctx.clone(),
+                ctx,
             );
         }
     }
 
     fn clear_compare(&mut self) {
-        if self.compare_image.is_some() || self.compare_path.is_some() {
+        if let Some(prev) = self.compare_path.take() {
+            self.cancel_image_request(&prev);
             self.compare_dirty = true;
         }
-        self.compare_image = None;
-        self.compare_path = None;
+        if self.compare_image.take().is_some() {
+            self.compare_dirty = true;
+        }
         // Bump generation so any in-flight Compare result is discarded.
         self.compare_generation = self.compare_generation.wrapping_add(1);
+    }
+
+    /// Issue a high-res decode for `path`, replacing any prior in-flight
+    /// request for the same path (the prior gets cancelled).
+    fn dispatch_image_request(
+        &mut self,
+        path: PathBuf,
+        purpose: ImagePurpose,
+        ctx: &egui::Context,
+    ) {
+        if let Some(prior) = self.pending_image_requests.insert(path.clone(), CancelToken::new()) {
+            prior.cancel();
+        }
+        let token = self
+            .pending_image_requests
+            .get(&path)
+            .expect("just inserted")
+            .clone();
+        io::request_image(path, purpose, token, self.sender.clone(), ctx.clone());
+    }
+
+    fn cancel_image_request(&mut self, path: &Path) {
+        if let Some(tok) = self.pending_image_requests.remove(path) {
+            tok.cancel();
+        }
+    }
+
+    fn cancel_all_image_requests(&mut self) {
+        for (_, tok) in self.pending_image_requests.drain() {
+            tok.cancel();
+        }
     }
 
     /// Display the given image in the viewport (and reset to fit-to-screen).
@@ -297,8 +348,16 @@ impl TessellatorApp {
         if index >= self.files.len() {
             return;
         }
+        // Direction tracking must read the *previous* selection, so update it
+        // before mutating selected_index.
+        self.update_direction_streak(index);
+
         let path = self.files[index].path.clone();
-        log::info!("Selected: {}", self.files[index].name);
+        log::info!(
+            "Selected: {} (streak={})",
+            self.files[index].name,
+            self.direction_streak
+        );
         self.selected_index = Some(index);
         self.high_res_generation = self.high_res_generation.wrapping_add(1);
         self.last_load_error = None;
@@ -307,32 +366,126 @@ impl TessellatorApp {
         if let Some(image) = self.image_cache.get(&path) {
             log::debug!("Cache hit: {:?}", path.file_name().unwrap_or_default());
             self.show_image(image);
+        } else if self.pending_image_requests.contains_key(&path) {
+            // An in-flight Preload (or earlier request) will cover this. The
+            // preload-completes-for-current-path branch in drain_messages will
+            // surface it when ready.
+            log::debug!("Awaiting in-flight request: {:?}", path.file_name().unwrap_or_default());
         } else {
-            self.pending_image_requests.insert(path.clone());
-            io::request_image(
+            self.dispatch_image_request(
                 path,
                 ImagePurpose::Display { generation: self.high_res_generation },
-                self.sender.clone(),
-                ctx.clone(),
+                ctx,
             );
         }
 
         self.preload_neighbors(ctx);
     }
 
-    /// Issue Preload requests for the images immediately before and after the
-    /// current selection, skipping anything already cached or in flight.
+    /// Update `direction_streak` based on the new selection vs the previous.
+    /// Same direction extends the streak; reversal or pause resets it.
+    fn update_direction_streak(&mut self, new_index: usize) {
+        const STREAK_DEBOUNCE: Duration = Duration::from_millis(500);
+        let now = Instant::now();
+        let recent = self
+            .last_select_time
+            .is_some_and(|t| now.duration_since(t) < STREAK_DEBOUNCE);
+
+        let signed_step: i32 = match self.selected_index {
+            Some(prev) if recent => match new_index.cmp(&prev) {
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+            },
+            _ => 0,
+        };
+
+        self.direction_streak = if signed_step == 0 {
+            0
+        } else if signed_step.signum() == self.direction_streak.signum() {
+            self.direction_streak.saturating_add(signed_step)
+        } else {
+            // Direction change: start a fresh streak in the new direction.
+            signed_step
+        };
+        self.last_select_time = Some(now);
+    }
+
+    /// Compute the active preload window based on traversal direction and
+    /// then (1) cancel anything pending that's outside it, (2) dispatch
+    /// preloads for empty slots inside it.
     fn preload_neighbors(&mut self, ctx: &egui::Context) {
         let Some(current) = self.selected_index else { return };
-        let neighbors = [current.checked_sub(1), Some(current + 1).filter(|&i| i < self.files.len())];
-        for n in neighbors.into_iter().flatten() {
+        let neighbors = self.compute_preload_window(current);
+
+        // Build the protected-paths set: the preload window plus the
+        // currently-displayed image (whose Display request may still be in
+        // flight) plus the active compare image.
+        let mut keep: HashSet<PathBuf> = neighbors
+            .iter()
+            .filter_map(|&i| self.files.get(i).map(|f| f.path.clone()))
+            .collect();
+        if let Some(p) = self.files.get(current).map(|f| f.path.clone()) {
+            keep.insert(p);
+        }
+        if let Some(p) = self.compare_path.clone() {
+            keep.insert(p);
+        }
+
+        // Cancel any pending request outside the protected set. Collected
+        // first so we don't mutate the map while iterating it.
+        let to_cancel: Vec<PathBuf> = self
+            .pending_image_requests
+            .keys()
+            .filter(|p| !keep.contains(p.as_path()))
+            .cloned()
+            .collect();
+        for path in to_cancel {
+            log::debug!(
+                "Cancelling stale request: {:?}",
+                path.file_name().unwrap_or_default()
+            );
+            self.cancel_image_request(&path);
+        }
+
+        // Issue preloads for slots not already cached or in flight.
+        for n in neighbors {
             let path = self.files[n].path.clone();
-            if self.image_cache.contains(&path) || self.pending_image_requests.contains(&path) {
+            if self.image_cache.contains(&path) || self.pending_image_requests.contains_key(&path) {
                 continue;
             }
-            self.pending_image_requests.insert(path.clone());
-            io::request_image(path, ImagePurpose::Preload, self.sender.clone(), ctx.clone());
+            self.dispatch_image_request(path, ImagePurpose::Preload, ctx);
         }
+    }
+
+    /// Two-image preload window. Stationary or weak streak: classic ±1.
+    /// Forward streak (≥ 2): N+1, N+2 (suspend N-1). Backward streak: mirror.
+    fn compute_preload_window(&self, current: usize) -> Vec<usize> {
+        let last = self.files.len();
+        let mut v = Vec::with_capacity(2);
+        if self.direction_streak >= 2 {
+            if current + 1 < last {
+                v.push(current + 1);
+            }
+            if current + 2 < last {
+                v.push(current + 2);
+            }
+        } else if self.direction_streak <= -2 {
+            if let Some(p) = current.checked_sub(1) {
+                v.push(p);
+            }
+            if let Some(p) = current.checked_sub(2) {
+                v.push(p);
+            }
+        } else {
+            if let Some(p) = current.checked_sub(1) {
+                v.push(p);
+            }
+            if current + 1 < last {
+                v.push(current + 1);
+            }
+        }
+        v
     }
 
     fn drain_messages(&mut self, ctx: &egui::Context) {
