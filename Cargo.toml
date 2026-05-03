@@ -20,3 +20,6 @@ notify = "6.1"
 serde = { version = "1.0", features = ["derive"] }
 memmap2 = "0.9"
 libc = "0.2"
+jpeg-decoder = "0.3"
+kamadak-exif = "0.6"
+wide = "0.7"

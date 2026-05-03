@@ -37,16 +37,39 @@ RUST_LOG=debug cargo run --release
 
 ## Keyboard shortcuts
 
+### Navigation
+
 | Key | Action |
 |---|---|
 | `Left` / `Right` | Previous / next image |
 | `Space` | Next image (alias) |
 | `Home` / `End` | First / last image |
 | `PageUp` / `PageDown` | Jump 10 images |
-| `F` | Fit image to viewport |
+
+### View
+
+| Key | Action |
+|---|---|
+| `F` or `0` | Fit image to viewport |
 | `Shift+F` | Fill viewport (may crop) |
 | `1` | 100% (native pixel size) |
+| `=` or `+` | Zoom in 10% |
+| `-` | Zoom out 10% |
 | `Alt` (held) | Show magnifier loupe under cursor |
+
+### Tools
+
+| Key | Action |
+|---|---|
+| `G` | Toggle grayscale (full color ↔ full B&W) |
+| `Esc` | Clear compare mode |
+
+### App
+
+| Key | Action |
+|---|---|
+| `Cmd+O` / `Ctrl+O` | Open folder picker |
+| `Cmd+R` / `Ctrl+R` | Re-scan current folder (preserves selection) |
 
 ## Mouse
 

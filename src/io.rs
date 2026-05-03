@@ -5,10 +5,12 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use image::{DynamicImage, ImageDecoder};
 use memmap2::Mmap;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use wide::u32x8;
 
 /// Files smaller than this don't benefit from mmap (page-table overhead and
 /// minimum mapping size dominate). Read into a Vec instead.
@@ -99,6 +101,63 @@ fn to_rgba8_consuming(img: DynamicImage) -> image::RgbaImage {
     }
 }
 
+fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+}
+
+/// Fast-path JPEG decode that uses libjpeg-style DCT scaling. For a 24MP
+/// source and a 128 px thumbnail target this is roughly 64x faster than
+/// decoding the full raster. Returns `None` for non-RGB/L8 pixel formats
+/// (CMYK, 16-bit grayscale) so the caller can fall back.
+fn try_decode_jpeg_scaled(bytes: &[u8], target_min_dim: u16) -> Option<DynamicImage> {
+    use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
+
+    let mut decoder = JpegDecoder::new(Cursor::new(bytes));
+    decoder.read_info().ok()?;
+
+    // Snap the request to the closest 1/N (N in {1, 2, 4, 8}) DCT scale.
+    decoder.scale(target_min_dim, target_min_dim).ok()?;
+
+    let pixels = decoder.decode().ok()?;
+    let info = decoder.info()?;
+    let w = info.width as u32;
+    let h = info.height as u32;
+
+    match info.pixel_format {
+        PixelFormat::RGB24 => {
+            // Promote to RGBA so downstream paths (thumbnail egui::ColorImage,
+            // viewport upload) stay on a single pixel format.
+            let mut rgba = Vec::with_capacity(pixels.len() / 3 * 4);
+            for px in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            image::RgbaImage::from_raw(w, h, rgba).map(DynamicImage::ImageRgba8)
+        }
+        PixelFormat::L8 => {
+            image::GrayImage::from_raw(w, h, pixels).map(DynamicImage::ImageLuma8)
+        }
+        // CMYK32, L16: rare. Fall back to the full image-crate path.
+        _ => None,
+    }
+}
+
+/// Read EXIF orientation directly from JPEG bytes without a full decode.
+/// Returns `NoTransforms` if the file has no EXIF or the field is missing.
+fn read_exif_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    use exif::{In, Reader, Tag};
+
+    let reader = Reader::new();
+    let Ok(data) = reader.read_from_container(&mut Cursor::new(bytes)) else {
+        return image::metadata::Orientation::NoTransforms;
+    };
+    let value = data
+        .get_field(Tag::Orientation, In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .unwrap_or(1);
+    image::metadata::Orientation::from_exif(value as u8)
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
 /// One level of an RGBA mip chain, ready for direct GPU upload.
 pub struct MipLevel {
     pub width: u32,
@@ -164,35 +223,116 @@ fn decode_image_with_mips(path: &Path) -> image::ImageResult<DecodedImage> {
 }
 
 /// 2x2 box-filter downsample of an RGBA8 buffer. Odd dimensions clamp to the
-/// last row/column. Box filtering is the mathematically correct choice when
-/// chained from the previous mip level, and runs ~4x faster than Triangle.
+/// last row/column.
+///
+/// Uses SWAR-on-u32 averaging (the `0x00FF00FF` mask trick splits each pixel
+/// into two pairs of channels that sum independently), accelerated to 8
+/// pixels at a time via `wide::u32x8`. For mips at or above 256x256 output,
+/// rows are processed in parallel via rayon. Below that, the rayon dispatch
+/// overhead exceeds the SIMD work, so we run sequentially.
 fn downsample_box(src: &[u8], src_w: u32, src_h: u32) -> MipLevel {
     let dst_w = (src_w / 2).max(1);
     let dst_h = (src_h / 2).max(1);
-    let stride = (src_w * 4) as usize;
+    let src_stride = (src_w as usize) * 4;
+    let dst_stride = (dst_w as usize) * 4;
     let mut dst = vec![0u8; (dst_w * dst_h * 4) as usize];
 
-    for y in 0..dst_h as usize {
-        let sy0 = y * 2;
+    // Below this output size, rayon dispatch overhead exceeds the work.
+    const PARALLEL_THRESHOLD: u32 = 256 * 256;
+    let parallel = dst_w * dst_h >= PARALLEL_THRESHOLD;
+
+    let row_op = |dst_y: usize, dst_row: &mut [u8]| {
+        let sy0 = dst_y * 2;
         let sy1 = (sy0 + 1).min((src_h - 1) as usize);
-        for x in 0..dst_w as usize {
-            let sx0 = x * 2;
-            let sx1 = (sx0 + 1).min((src_w - 1) as usize);
-            let p00 = sy0 * stride + sx0 * 4;
-            let p01 = sy0 * stride + sx1 * 4;
-            let p10 = sy1 * stride + sx0 * 4;
-            let p11 = sy1 * stride + sx1 * 4;
-            let di = (y * dst_w as usize + x) * 4;
-            for c in 0..4 {
-                let sum = src[p00 + c] as u16
-                    + src[p01 + c] as u16
-                    + src[p10 + c] as u16
-                    + src[p11 + c] as u16;
-                dst[di + c] = (sum / 4) as u8;
-            }
+        // Both source rows are 4-byte aligned because `src` came from a Vec<u8>
+        // (≥ 16-byte alignment) and `src_stride` is a multiple of 4.
+        let top = bytemuck::cast_slice::<u8, u32>(
+            &src[sy0 * src_stride..sy0 * src_stride + src_stride],
+        );
+        let bot = bytemuck::cast_slice::<u8, u32>(
+            &src[sy1 * src_stride..sy1 * src_stride + src_stride],
+        );
+        let dst_row = bytemuck::cast_slice_mut::<u8, u32>(dst_row);
+        downsample_row(top, bot, dst_row, src_w as usize, dst_w as usize);
+    };
+
+    if parallel {
+        dst.par_chunks_mut(dst_stride)
+            .enumerate()
+            .for_each(|(y, row)| row_op(y, row));
+    } else {
+        for (y, row) in dst.chunks_mut(dst_stride).enumerate() {
+            row_op(y, row);
         }
     }
+
     MipLevel { width: dst_w, height: dst_h, rgba: dst }
+}
+
+#[inline]
+fn downsample_row(top: &[u32], bot: &[u32], dst: &mut [u32], src_w: usize, dst_w: usize) {
+    let simd_chunks = dst_w / 8;
+    for chunk in 0..simd_chunks {
+        let x = chunk * 16;
+        // Manual deinterleave: even-indexed input pixels into one vector,
+        // odd-indexed into the other. wide doesn't expose shuffles, so we
+        // build the lanes explicitly. The compiler typically unrolls this
+        // into a few NEON/AVX shuffle ops.
+        let p00 = u32x8::from([
+            top[x],     top[x + 2], top[x + 4], top[x + 6],
+            top[x + 8], top[x + 10], top[x + 12], top[x + 14],
+        ]);
+        let p01 = u32x8::from([
+            top[x + 1], top[x + 3], top[x + 5], top[x + 7],
+            top[x + 9], top[x + 11], top[x + 13], top[x + 15],
+        ]);
+        let p10 = u32x8::from([
+            bot[x],     bot[x + 2], bot[x + 4], bot[x + 6],
+            bot[x + 8], bot[x + 10], bot[x + 12], bot[x + 14],
+        ]);
+        let p11 = u32x8::from([
+            bot[x + 1], bot[x + 3], bot[x + 5], bot[x + 7],
+            bot[x + 9], bot[x + 11], bot[x + 13], bot[x + 15],
+        ]);
+        let avg = avg_4_u32x8(p00, p01, p10, p11);
+        dst[chunk * 8..chunk * 8 + 8].copy_from_slice(&avg.to_array());
+    }
+    // Scalar tail for the remaining 0..7 output pixels.
+    let tail_start = simd_chunks * 8;
+    for (i, slot) in dst[tail_start..dst_w].iter_mut().enumerate() {
+        let x = tail_start + i;
+        let sx0 = x * 2;
+        let sx1 = (sx0 + 1).min(src_w - 1);
+        *slot = avg_4_u32(top[sx0], top[sx1], bot[sx0], bot[sx1]);
+    }
+}
+
+/// Average 8 sets of 4 RGBA pixels in parallel using SWAR + SIMD.
+///
+/// Splitting each u32 with `0x00FF00FF` puts R and B into separate u16 lanes
+/// inside one u32; shifting by 8 then masking does the same for G and A.
+/// 4 channel values sum to ≤ 1020, which fits in 10 bits — no carry into
+/// the adjacent lane.
+#[inline]
+fn avg_4_u32x8(p00: u32x8, p01: u32x8, p10: u32x8, p11: u32x8) -> u32x8 {
+    let mask = u32x8::splat(0x00FF_00FF);
+    let lo = (p00 & mask) + (p01 & mask) + (p10 & mask) + (p11 & mask);
+    let hi = ((p00 >> 8) & mask)
+        + ((p01 >> 8) & mask)
+        + ((p10 >> 8) & mask)
+        + ((p11 >> 8) & mask);
+    ((lo >> 2) & mask) | (((hi >> 2) & mask) << 8)
+}
+
+#[inline]
+fn avg_4_u32(p00: u32, p01: u32, p10: u32, p11: u32) -> u32 {
+    let mask = 0x00FF_00FF_u32;
+    let lo = (p00 & mask) + (p01 & mask) + (p10 & mask) + (p11 & mask);
+    let hi = ((p00 >> 8) & mask)
+        + ((p01 >> 8) & mask)
+        + ((p10 >> 8) & mask)
+        + ((p11 >> 8) & mask);
+    ((lo >> 2) & mask) | (((hi >> 2) & mask) << 8)
 }
 
 /// Why an image was decoded. `Display` results drive the viewport (subject to
@@ -261,6 +401,15 @@ pub fn scan_folder(
                 });
             }
         }
+        // Case-insensitive sort by filename. `sort_by_cached_key` allocates
+        // each lowercase key exactly once, vs. once per comparison.
+        found.sort_by_cached_key(|f| {
+            f.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+        });
         log::info!(
             "Folder scan complete: {} images under {:?} (depth {})",
             found.len(),
@@ -275,9 +424,9 @@ pub fn scan_folder(
 pub fn request_thumbnail(path: PathBuf, sender: Sender<Message>, ctx: egui::Context) {
     rayon::spawn(move || {
         // Thumbnails don't need mips - they're sampled near 1:1 by egui.
-        match decode_image(&path) {
-            Ok(img) => {
-                let thumbnail = img.thumbnail(128, 128);
+        let result = decode_thumbnail(&path);
+        match result {
+            Some(thumbnail) => {
                 let size = [thumbnail.width() as usize, thumbnail.height() as usize];
                 let pixels = to_rgba8_consuming(thumbnail);
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -286,13 +435,45 @@ pub fn request_thumbnail(path: PathBuf, sender: Sender<Message>, ctx: egui::Cont
                 );
                 let _ = sender.send(Message::ThumbnailLoaded { path, image: color_image });
             }
-            Err(e) => {
-                log::warn!("Thumbnail decode failed for {:?}: {}", path, e);
+            None => {
+                log::warn!("Thumbnail decode failed for {:?}", path);
                 let _ = sender.send(Message::ThumbnailFailed);
             }
         }
         ctx.request_repaint();
     });
+}
+
+/// Produce a thumbnail-sized DynamicImage. Tries the JPEG DCT fast-path first
+/// and falls back to the full image-crate decode for non-JPEG or unsupported
+/// JPEG variants. Always applies EXIF orientation so phone photos display
+/// upright.
+fn decode_thumbnail(path: &Path) -> Option<DynamicImage> {
+    let bytes = read_file_bytes(path).ok()?;
+    let slice = bytes.as_slice();
+
+    // Fast path: JPEG via DCT scale. Request 256 so we have a 2x supersample
+    // for the final thumbnail() downsample, which gives smoother edges.
+    if is_jpeg(slice)
+        && let Some(mut img) = try_decode_jpeg_scaled(slice, 256)
+    {
+        let orientation = read_exif_orientation(slice);
+        img.apply_orientation(orientation);
+        return Some(img.thumbnail(128, 128));
+    }
+
+    // Fallback: full decode. We've already read the bytes once via mmap, so
+    // hand them straight to ImageReader instead of re-opening the file.
+    let cursor = Cursor::new(slice);
+    let reader = image::ImageReader::new(cursor).with_guessed_format().ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).ok()?;
+    drop(bytes);
+    img.apply_orientation(orientation);
+    Some(img.thumbnail(128, 128))
 }
 
 pub fn request_image(

@@ -30,6 +30,11 @@ pub struct FileEntry {
 /// Default folder-scan recursion depth. 1 = the folder itself only.
 const DEFAULT_RECURSION_DEPTH: usize = 2;
 
+#[cfg(target_os = "macos")]
+const OPEN_SHORTCUT_LABEL: &str = "Cmd+O";
+#[cfg(not(target_os = "macos"))]
+const OPEN_SHORTCUT_LABEL: &str = "Ctrl+O";
+
 /// Window of inactivity after a watcher event before triggering a re-scan.
 const FOLDER_REFRESH_DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -122,6 +127,10 @@ pub struct TessellatorApp {
     loupe_radius: f32,
     dither: bool,
 
+    /// Multiplier to apply to the current zoom on the next viewport frame
+    /// (set by keyboard zoom-step shortcuts).
+    pending_zoom_step: Option<f32>,
+
     /// Pixel under the cursor in the viewport (image coords + RGBA), updated
     /// each frame. Drives the eyedropper readout in the status bar.
     cursor_pixel: Option<CursorSample>,
@@ -199,6 +208,7 @@ impl TessellatorApp {
             loupe_zoom: saved.loupe_zoom.unwrap_or(4.0),
             loupe_radius: saved.loupe_radius.unwrap_or(120.0),
             dither: saved.dither.unwrap_or(true),
+            pending_zoom_step: None,
             cursor_pixel: None,
             folder_watcher: None,
             folder_refresh_at: None,
@@ -442,52 +452,70 @@ impl TessellatorApp {
     /// Read keyboard navigation and view-mode keys and act on them. Uses
     /// `consume_key` so a focused widget doesn't also see the press.
     fn handle_keyboard_nav(&mut self, ctx: &egui::Context) {
-        let (left, right, home, end, page_up, page_down, space, fit, fill, one_to_one) =
-            ctx.input_mut(|i| {
-                (
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::End),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::F),
-                    i.consume_key(egui::Modifiers::SHIFT, egui::Key::F),
-                    i.consume_key(egui::Modifiers::NONE, egui::Key::Num1),
-                )
-            });
+        let p = read_pressed_keys(ctx);
 
-        if fit {
-            self.view = ViewState::FitOnNextFrame;
-        } else if fill {
-            self.view = ViewState::FillOnNextFrame;
-        } else if one_to_one {
-            self.view = ViewState::one_to_one();
+        // App-wide commands.
+        if p.open
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            self.open_folder(path, ctx);
+        }
+        if p.refresh
+            && let Some(folder) = self.folder_path.clone()
+        {
+            self.restore_selection = self
+                .selected_index
+                .and_then(|i| self.files.get(i))
+                .map(|f| f.path.clone());
+            self.open_folder(folder, ctx);
+        }
+        if p.escape {
+            self.clear_compare();
         }
 
+        // View mode.
+        if p.fit {
+            self.view = ViewState::FitOnNextFrame;
+        } else if p.fill {
+            self.view = ViewState::FillOnNextFrame;
+        } else if p.one_to_one {
+            self.view = ViewState::one_to_one();
+        }
+        if p.zoom_in {
+            let acc = self.pending_zoom_step.unwrap_or(1.0) * 1.1;
+            self.pending_zoom_step = Some(acc);
+        }
+        if p.zoom_out {
+            let acc = self.pending_zoom_step.unwrap_or(1.0) / 1.1;
+            self.pending_zoom_step = Some(acc);
+        }
+
+        // Tools.
+        if p.toggle_grayscale {
+            self.grayscale = if self.grayscale > 0.5 { 0.0 } else { 1.0 };
+        }
+
+        // Navigation through file list.
         if self.files.is_empty() {
             return;
         }
         let last = self.files.len() - 1;
         let current = self.selected_index;
-
-        let target = if home {
+        let target = if p.home {
             Some(0)
-        } else if end {
+        } else if p.end {
             Some(last)
-        } else if left {
+        } else if p.left {
             Some(current.map_or(0, |i| i.saturating_sub(1)))
-        } else if right || space {
+        } else if p.right {
             Some(current.map_or(0, |i| (i + 1).min(last)))
-        } else if page_up {
+        } else if p.page_up {
             Some(current.map_or(0, |i| i.saturating_sub(10)))
-        } else if page_down {
+        } else if p.page_down {
             Some(current.map_or(0, |i| (i + 10).min(last)))
         } else {
             None
         };
-
         if let Some(i) = target
             && Some(i) != current
         {
@@ -563,7 +591,10 @@ impl TessellatorApp {
             .show(ctx, |ui| {
                 ui.heading("Tessellator");
                 ui.horizontal(|ui| {
-                    if ui.button("Open Folder...").clicked()
+                    let btn = ui
+                        .button("Open Folder...")
+                        .on_hover_text(format!("Open folder ({})", OPEN_SHORTCUT_LABEL));
+                    if btn.clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
                     {
                         open_folder = Some(path);
@@ -817,6 +848,12 @@ impl TessellatorApp {
                 return;
             };
 
+            // Keyboard zoom step (=/+/-) - applied around screen center, so
+            // pan stays as-is.
+            if let Some(factor) = self.pending_zoom_step.take() {
+                zoom *= factor;
+            }
+
             if response.hovered() {
                 let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll_delta != 0.0 {
@@ -930,6 +967,64 @@ fn format_bytes(n: u64) -> String {
     } else {
         format!("{:.1} {}", value, UNITS[unit])
     }
+}
+
+/// One-frame snapshot of which shortcuts fired this frame. Centralising the
+/// `consume_key` calls here keeps the dispatcher in `handle_keyboard_nav`
+/// readable and ensures one consistent set of modifiers.
+#[derive(Default)]
+struct Pressed {
+    // Navigation
+    left: bool,
+    right: bool,
+    home: bool,
+    end: bool,
+    page_up: bool,
+    page_down: bool,
+    // App
+    open: bool,
+    refresh: bool,
+    escape: bool,
+    // View
+    fit: bool,
+    fill: bool,
+    one_to_one: bool,
+    zoom_in: bool,
+    zoom_out: bool,
+    // Tools
+    toggle_grayscale: bool,
+}
+
+fn read_pressed_keys(ctx: &egui::Context) -> Pressed {
+    use egui::{Key, Modifiers};
+    ctx.input_mut(|i| {
+        let space = i.consume_key(Modifiers::NONE, Key::Space);
+        Pressed {
+            left: i.consume_key(Modifiers::NONE, Key::ArrowLeft),
+            right: i.consume_key(Modifiers::NONE, Key::ArrowRight) || space,
+            home: i.consume_key(Modifiers::NONE, Key::Home),
+            end: i.consume_key(Modifiers::NONE, Key::End),
+            page_up: i.consume_key(Modifiers::NONE, Key::PageUp),
+            page_down: i.consume_key(Modifiers::NONE, Key::PageDown),
+
+            open: i.consume_key(Modifiers::COMMAND, Key::O),
+            refresh: i.consume_key(Modifiers::COMMAND, Key::R),
+            escape: i.consume_key(Modifiers::NONE, Key::Escape),
+
+            fit: i.consume_key(Modifiers::NONE, Key::F)
+                || i.consume_key(Modifiers::NONE, Key::Num0),
+            fill: i.consume_key(Modifiers::SHIFT, Key::F),
+            one_to_one: i.consume_key(Modifiers::NONE, Key::Num1),
+            // Accept "=" (no shift), "+" (shifted "="), and the dedicated Plus
+            // key on layouts that have one.
+            zoom_in: i.consume_key(Modifiers::NONE, Key::Equals)
+                || i.consume_key(Modifiers::SHIFT, Key::Equals)
+                || i.consume_key(Modifiers::NONE, Key::Plus),
+            zoom_out: i.consume_key(Modifiers::NONE, Key::Minus),
+
+            toggle_grayscale: i.consume_key(Modifiers::NONE, Key::G),
+        }
+    })
 }
 
 fn format_zoom(view: ViewState) -> String {

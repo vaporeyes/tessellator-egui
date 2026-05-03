@@ -35,14 +35,47 @@ src/
 ### Threading model
 
 - **UI thread** drives `App::update()` and reads from a `crossbeam_channel::Receiver<Message>`.
-- **Rayon pool** does all CPU-heavy image work: decode, EXIF rotate, RGBA convert, mip chain generation. Each result is sent back as a `Message`.
+- **Rayon pool** does all CPU-heavy image work: file read, decode, EXIF rotate, RGBA convert, mip chain generation. Each result is sent back as a `Message`. Mip generation itself uses rayon's row-level parallelism for the larger mip levels.
 - **One-off `std::thread`** for folder scanning (I/O-bound, doesn't deserve a Rayon worker).
 - **notify watcher thread** owned by `FolderWatcher`. Sends `Message::FolderChanged` and is dropped when the folder changes.
 - **Render thread** (egui_wgpu's) runs `TessellatorCallback::prepare` and `paint`. The decision to do all CPU prep on the worker (not in `prepare`) is load-bearing — see "High-res upload path" below.
 
+### File I/O (mmap-first)
+
+`io::read_file_bytes(path)` returns a `FileBytes` that's either an `Mmap` or a `Vec<u8>`. Decisions:
+
+- File < 256 KB: heap-read (mmap setup overhead exceeds benefit).
+- macOS network mount (`nfs`/`smbfs`/`afpfs`/`webdav`/`ftp` via `libc::statfs`): heap-read (SIGBUS on disconnect isn't catchable in safe Rust).
+- Otherwise: try `Mmap::map`, fall back to heap-read on error.
+
+The decoder reads from `Cursor<&[u8]>` over the underlying slice — no kernel-to-user copy on the mmap path. **The `unsafe` in `Mmap::map` is the truncation caveat** — see the `// SAFETY:` comment in `read_file_bytes`.
+
+### Decode pipeline
+
+`io::decode_image(path)`: full-quality decode for the viewport. Reads via mmap, decodes via `image::ImageReader`, applies EXIF orientation.
+
+`io::decode_thumbnail(path)`: optimized for 128 px thumbnails.
+- **JPEG fast-path** via `jpeg-decoder`: requests `decoder.scale(256, 256)` which snaps to the closest 1/N (N ∈ {1, 2, 4, 8}) DCT factor. Decodes at the scaled resolution — for a 24MP source this is ~64x less raster work than a full decode.
+- EXIF orientation read separately via `kamadak-exif` (the fast path bypasses the image crate's `ImageDecoder::orientation()`).
+- Falls back to the full image-crate decode for non-JPEG, CMYK JPEGs, and L16 grayscale JPEGs.
+- Either way, then `.thumbnail(128, 128)` for final downsample.
+
 ### High-res upload path
 
 CPU prep is concentrated in the decode worker. `io::decode_image_with_mips` produces a `DecodedImage { width, height, mips: Vec<MipLevel> }` where each `MipLevel` is raw RGBA bytes ready for `queue.write_texture`. The render thread does almost no CPU work — just iterating mips and uploading. **Do not move mip generation back into `TessellatorResources::set_main_texture`**; that's what made the viewer feel sluggish before this change.
+
+### Mip generation (SWAR + SIMD + rayon)
+
+`io::downsample_box` does a 2x2 box filter on RGBA8 with three layers of speedup:
+1. **SWAR averaging** per `u32` pixel: the `0x00FF00FF` mask trick splits R/B from G/A into separate u16 lanes within one u32 so 4-channel averaging is one mask + add + shift, no per-byte loop. Max sum (4 × 255 = 1020) fits in 10 bits, no carry into adjacent lanes.
+2. **SIMD via `wide::u32x8`**: 8 output pixels per batch. Manual deinterleave (no shuffle in `wide`) into even/odd vectors. Compiler typically lowers to a few NEON/AVX shuffles.
+3. **Rayon row parallelism** for output mips ≥ 256×256. Below that, dispatch overhead exceeds the work — runs sequentially.
+
+`bytemuck::cast_slice` reinterprets row bytes as `&[u32]` without copying. Alignment is guaranteed by Vec's allocator + 4-byte stride.
+
+### Zero-copy RGBA
+
+`io::to_rgba8_consuming` matches on `DynamicImage::ImageRgba8` and consumes the buffer in-place. For other variants (e.g. `ImageRgb8` from JPEG) the conversion is unavoidable. Used in both the high-res and thumbnail paths.
 
 The Display path:
 1. `select_image` checks the LRU cache; on hit, no decode is issued.
@@ -106,6 +139,18 @@ Pure shader. Inside a screen-space disc centered on `loupe_center_screen` with r
 
 `FolderWatcher` wraps `notify::RecommendedWatcher`. Events touching image files send `Message::FolderChanged`; the app debounces with a 500 ms inactivity window (`folder_refresh_at: Option<Instant>`) and uses `ctx.request_repaint_after` so the wake doesn't depend on user interaction. Selection is preserved across rescan via `restore_selection: Option<PathBuf>` resolved in the next `FilesFound` handler.
 
+### Folder sort
+
+`io::scan_folder` sorts results case-insensitively by filename via `sort_by_cached_key` (one lowercase allocation per file, not per comparison) before sending `FilesFound`. The UI never sees an unsorted list.
+
+### Keyboard shortcuts
+
+All shortcuts are read in one place: `read_pressed_keys` returns a `Pressed` struct of `bool`s, dispatched by `handle_keyboard_nav`. Adding a new shortcut means adding a field + a `consume_key` line + a dispatch branch — three edits in two functions. `consume_key` ensures focused widgets (sliders, text inputs) don't also receive the press.
+
+`Modifiers::COMMAND` is egui's portable "Cmd on macOS, Ctrl elsewhere" — use it for app-level shortcuts like Open/Refresh.
+
+Keyboard zoom shortcuts (`=`/`+`/`-`) write to `pending_zoom_step: Option<f32>`, which `show_viewport` consumes when it has the live zoom in scope. Same deferral pattern as `pending_scroll_to_index`.
+
 ### Persistence
 
 Uses `eframe::App::save` with the `persistence` feature. `PersistentState` is a `serde` struct of `Option<T>` fields so adding new fields later doesn't break old saved state. Auto-opens the last folder on startup if it still exists. Sidebar width and window size are handled by eframe's context persistence (no extra code).
@@ -121,9 +166,13 @@ Issued only for currently-visible rows (driven by `ScrollArea::show_rows`'s `row
 - Surgical edits only - don't refactor unrelated areas while touching this file.
 - Use `log::*` macros, never `println!` for diagnostics.
 - WGSL: avoid reserved words (`target`, `binding`, etc.) for identifiers - naga rejects them and the failure only surfaces at runtime.
+- Adding a keyboard shortcut: add a field to `Pressed`, a `consume_key` line in `read_pressed_keys`, a dispatch branch in `handle_keyboard_nav`. Update README's shortcut tables.
+- Persistence (`PersistentState`): all fields are `Option<T>` so adding new fields doesn't break old saved state.
 
 ## Known limitations
 
 - **HDR / wide-gamut display** is not implemented. eframe 0.31 doesn't expose surface format selection. Revisit when upgrading eframe. The dither pass is a partial substitute that eliminates banding within the LDR pipeline.
-- **EXIF orientation** is honored only for formats whose `image::ImageDecoder` reports orientation (JPEG works; PNG/WebP technically can carry EXIF chunks but the crate may not parse them).
+- **EXIF orientation** is honored only for formats whose `image::ImageDecoder` reports orientation (JPEG works; PNG/WebP technically can carry EXIF chunks but the crate may not parse them). The thumbnail JPEG fast-path uses `kamadak-exif` directly so it gets orientation regardless.
 - **Folder watcher** uses `notify::RecursiveMode::Recursive` for any depth > 1 - notify doesn't accept a depth limit, so we may receive (and ignore) events outside the visible depth.
+- **Filename sort is lexicographic, not natural.** `Photo (10).jpg` sorts before `Photo (2).jpg`. Camera/phone filenames (zero-padded `IMG_0001`) sort correctly. Add `natord` if natural sort is needed.
+- **Network share detection is macOS-only.** Linux/Windows always pick mmap, taking the SIGBUS risk on remote mounts. Cross-platform statfs is straightforward to add (~10 lines per platform) when needed.
