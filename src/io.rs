@@ -95,11 +95,13 @@ fn downsample_box(src: &[u8], src_w: u32, src_h: u32) -> MipLevel {
 }
 
 /// Why an image was decoded. `Display` results drive the viewport (subject to
-/// generation matching); `Preload` results only populate the cache.
+/// generation matching); `Preload` results only populate the cache; `Compare`
+/// results populate the right-side compare slot.
 #[derive(Debug, Clone, Copy)]
 pub enum ImagePurpose {
     Display { generation: u64 },
     Preload,
+    Compare { generation: u64 },
 }
 
 pub enum Message {

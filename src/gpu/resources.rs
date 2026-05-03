@@ -16,11 +16,21 @@ pub struct ShaderSettings {
     pub grid_size: f32,
     /// 0 = none, 1 = grid, 2 = rule of thirds, 3 = golden ratio, 4 = diagonal.
     pub overlay_mode: u32,
+    pub compare_divider: f32,
+    pub compare_active: u32,
+    pub loupe_active: u32,
+    pub loupe_zoom: f32,
+    pub loupe_center_uv: [f32; 2],
+    pub loupe_center_screen: [f32; 2],
+    pub loupe_radius: f32,
+    pub dither: u32,
+    pub _pad0: f32,
+    pub _pad1: f32,
 }
 
-// 3 columns of mat3x3<f32> padded to 16B each (48B) plus four f32 scalars (16B).
+// Layout matches WGSL Settings: 48B mat3x3 + four 16B blocks of scalars/vec2s.
 // A future field reorder that breaks WGSL alignment will fail to compile.
-const _: () = assert!(std::mem::size_of::<ShaderSettings>() == 64);
+const _: () = assert!(std::mem::size_of::<ShaderSettings>() == 112);
 
 pub struct TessellatorResources {
     pipeline: wgpu::RenderPipeline,
@@ -28,7 +38,9 @@ pub struct TessellatorResources {
     sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
     settings_buffer: wgpu::Buffer,
-    current_texture: Option<(wgpu::Texture, wgpu::BindGroup, [u32; 2])>,
+    main_texture: Option<wgpu::Texture>,
+    compare_texture: Option<wgpu::Texture>,
+    bind_group: Option<wgpu::BindGroup>,
 }
 
 impl TessellatorResources {
@@ -66,6 +78,16 @@ impl TessellatorResources {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -156,49 +178,56 @@ impl TessellatorResources {
             sampler,
             vertex_buffer,
             settings_buffer,
-            current_texture: None,
+            main_texture: None,
+            compare_texture: None,
+            bind_group: None,
         }
     }
 
-    pub fn update_texture(
+    pub fn set_main_texture(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         image: &DecodedImage,
     ) {
-        let width = image.width;
-        let height = image.height;
-        let mip_level_count = image.mips.len() as u32;
-        log::info!(
-            "Uploading texture: {}x{} ({} mip levels)",
-            width,
-            height,
-            mip_level_count
-        );
+        self.main_texture = Some(create_image_texture(device, queue, image, "main"));
+        self.rebuild_bind_group(device);
+    }
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("tessellator.high_res_texture"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    pub fn set_compare_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: Option<&DecodedImage>,
+    ) {
+        self.compare_texture =
+            image.map(|img| create_image_texture(device, queue, img, "compare"));
+        self.rebuild_bind_group(device);
+    }
 
-        for (level, mip) in image.mips.iter().enumerate() {
-            upload_mip(queue, &texture, level as u32, &mip.rgba, mip.width, mip.height);
-        }
+    /// Rebuild the bind group from the current main + (optional) compare
+    /// textures. The compare slot falls back to the main texture so the
+    /// shader's binding always has something to sample, even when compare
+    /// mode is off.
+    fn rebuild_bind_group(&mut self, device: &wgpu::Device) {
+        let Some(main) = &self.main_texture else {
+            self.bind_group = None;
+            return;
+        };
+        let main_view = main.create_view(&wgpu::TextureViewDescriptor::default());
+        let compare_view = self
+            .compare_texture
+            .as_ref()
+            .unwrap_or(main)
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tessellator.bind_group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(&main_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -208,10 +237,12 @@ impl TessellatorResources {
                     binding: 2,
                     resource: self.settings_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&compare_view),
+                },
             ],
-        });
-
-        self.current_texture = Some((texture, bind_group, [width, height]));
+        }));
     }
 
     pub fn update_settings(&self, queue: &wgpu::Queue, settings: ShaderSettings) {
@@ -227,8 +258,40 @@ impl TessellatorResources {
     }
 
     pub fn current_bind_group(&self) -> Option<&wgpu::BindGroup> {
-        self.current_texture.as_ref().map(|(_, bg, _)| bg)
+        self.bind_group.as_ref()
     }
+}
+
+fn create_image_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    image: &DecodedImage,
+    label_suffix: &str,
+) -> wgpu::Texture {
+    let width = image.width;
+    let height = image.height;
+    let mip_level_count = image.mips.len() as u32;
+    log::info!(
+        "Uploading {} texture: {}x{} ({} mips)",
+        label_suffix,
+        width,
+        height,
+        mip_level_count
+    );
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tessellator.image_texture"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (level, mip) in image.mips.iter().enumerate() {
+        upload_mip(queue, &texture, level as u32, &mip.rgba, mip.width, mip.height);
+    }
+    texture
 }
 
 fn upload_mip(

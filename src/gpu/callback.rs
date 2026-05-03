@@ -1,5 +1,5 @@
 // ABOUTME: egui_wgpu paint callback that lazily creates GPU resources and uploads
-// ABOUTME: any pending high-res image before drawing the textured viewport quad.
+// ABOUTME: any pending high-res or compare image before drawing the textured viewport quad.
 
 use eframe::wgpu;
 use std::sync::Arc;
@@ -7,8 +7,16 @@ use std::sync::Arc;
 use super::resources::{ShaderSettings, TessellatorResources};
 use crate::io::DecodedImage;
 
+/// What to do with the compare-slot texture this frame.
+pub enum CompareUpload {
+    NoChange,
+    Set(Arc<DecodedImage>),
+    Clear,
+}
+
 pub struct TessellatorCallback {
     pub image: Option<Arc<DecodedImage>>,
+    pub compare: CompareUpload,
     pub settings: ShaderSettings,
     pub format: wgpu::TextureFormat,
 }
@@ -30,7 +38,12 @@ impl egui_wgpu::CallbackTrait for TessellatorCallback {
             .expect("TessellatorResources was just inserted");
 
         if let Some(image) = &self.image {
-            tess.update_texture(device, queue, image);
+            tess.set_main_texture(device, queue, image);
+        }
+        match &self.compare {
+            CompareUpload::Set(image) => tess.set_compare_texture(device, queue, Some(image)),
+            CompareUpload::Clear => tess.set_compare_texture(device, queue, None),
+            CompareUpload::NoChange => {}
         }
         tess.update_settings(queue, self.settings);
 

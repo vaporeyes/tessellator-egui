@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::cache::ImageCache;
-use crate::gpu::{ShaderSettings, TessellatorCallback};
+use crate::gpu::{CompareUpload, ShaderSettings, TessellatorCallback};
 use crate::io::{self, DecodedImage, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
 use crate::watcher::FolderWatcher;
@@ -110,6 +110,18 @@ pub struct TessellatorApp {
     needs_upload: bool,
     current_image_size: Option<[u32; 2]>,
 
+    /// Right-side image for compare mode (None = compare off).
+    compare_image: Option<Arc<DecodedImage>>,
+    compare_path: Option<PathBuf>,
+    compare_divider: f32,
+    compare_generation: u64,
+    /// Pending compare-slot change to ship with the next paint callback.
+    compare_dirty: bool,
+
+    loupe_zoom: f32,
+    loupe_radius: f32,
+    dither: bool,
+
     /// Pixel under the cursor in the viewport (image coords + RGBA), updated
     /// each frame. Drives the eyedropper readout in the status bar.
     cursor_pixel: Option<CursorSample>,
@@ -137,6 +149,10 @@ struct PersistentState {
     overlay_opacity: Option<f32>,
     grid_size: Option<f32>,
     grayscale: Option<f32>,
+    compare_divider: Option<f32>,
+    loupe_zoom: Option<f32>,
+    loupe_radius: Option<f32>,
+    dither: Option<bool>,
 }
 
 impl TessellatorApp {
@@ -175,6 +191,14 @@ impl TessellatorApp {
             current_image: None,
             needs_upload: false,
             current_image_size: None,
+            compare_image: None,
+            compare_path: None,
+            compare_divider: saved.compare_divider.unwrap_or(0.5),
+            compare_generation: 0,
+            compare_dirty: false,
+            loupe_zoom: saved.loupe_zoom.unwrap_or(4.0),
+            loupe_radius: saved.loupe_radius.unwrap_or(120.0),
+            dither: saved.dither.unwrap_or(true),
             cursor_pixel: None,
             folder_watcher: None,
             folder_refresh_at: None,
@@ -200,6 +224,7 @@ impl TessellatorApp {
         self.current_image = None;
         self.needs_upload = false;
         self.cursor_pixel = None;
+        self.clear_compare();
         io::scan_folder(
             path.clone(),
             self.recursion_depth,
@@ -219,6 +244,35 @@ impl TessellatorApp {
             Ok(w) => self.folder_watcher = Some(w),
             Err(e) => log::warn!("Failed to start folder watcher for {:?}: {}", path, e),
         }
+    }
+
+    fn start_compare(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.compare_generation = self.compare_generation.wrapping_add(1);
+        self.compare_path = Some(path.clone());
+        if let Some(image) = self.image_cache.get(&path) {
+            self.compare_image = Some(image);
+            self.compare_dirty = true;
+        } else {
+            self.compare_image = None;
+            self.compare_dirty = true;
+            self.pending_image_requests.insert(path.clone());
+            io::request_image(
+                path,
+                ImagePurpose::Compare { generation: self.compare_generation },
+                self.sender.clone(),
+                ctx.clone(),
+            );
+        }
+    }
+
+    fn clear_compare(&mut self) {
+        if self.compare_image.is_some() || self.compare_path.is_some() {
+            self.compare_dirty = true;
+        }
+        self.compare_image = None;
+        self.compare_path = None;
+        // Bump generation so any in-flight Compare result is discarded.
+        self.compare_generation = self.compare_generation.wrapping_add(1);
     }
 
     /// Display the given image in the viewport (and reset to fit-to-screen).
@@ -335,6 +389,14 @@ impl TessellatorApp {
                                 })
                             {
                                 self.show_image(image);
+                            }
+                        }
+                        ImagePurpose::Compare { generation } => {
+                            if generation == self.compare_generation
+                                && self.compare_path.as_deref() == Some(&path)
+                            {
+                                self.compare_image = Some(image);
+                                self.compare_dirty = true;
                             }
                         }
                     }
@@ -478,6 +540,10 @@ impl eframe::App for TessellatorApp {
             overlay_opacity: Some(self.overlay_opacity),
             grid_size: Some(self.grid_size),
             grayscale: Some(self.grayscale),
+            compare_divider: Some(self.compare_divider),
+            loupe_zoom: Some(self.loupe_zoom),
+            loupe_radius: Some(self.loupe_radius),
+            dither: Some(self.dither),
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -610,8 +676,42 @@ impl TessellatorApp {
                 if ui.button("100%").on_hover_text("Display at native pixel size (1)").clicked() {
                     self.view = ViewState::one_to_one();
                 }
+                ui.separator();
+                self.show_compare_controls(ui, ctx);
+                ui.separator();
+                ui.checkbox(&mut self.dither, "Dither")
+                    .on_hover_text("Add 1-bit noise to remove gradient banding");
             });
         });
+    }
+
+    fn show_compare_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        match self.compare_path.clone() {
+            None => {
+                if ui
+                    .button("Compare...")
+                    .on_hover_text("Pick a second image to A/B compare")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                        .pick_file()
+                {
+                    self.start_compare(path, ctx);
+                }
+            }
+            Some(p) => {
+                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                ui.label(format!("vs {}", name));
+                if ui.button("X").on_hover_text("Stop comparing").clicked() {
+                    self.clear_compare();
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.compare_divider, 0.0..=1.0)
+                        .text("Split")
+                        .clamping(egui::SliderClamping::Always),
+                );
+            }
+        }
     }
 
     fn show_status_bar(&mut self, ctx: &egui::Context) {
@@ -739,10 +839,11 @@ impl TessellatorApp {
             self.view = ViewState::Manual { zoom, pan };
 
             let scale = egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y);
+            let mouse_pos = ui.input(|i| i.pointer.hover_pos());
 
             // Eyedropper: sample the pixel under the cursor.
             self.cursor_pixel = if response.hovered() {
-                ui.input(|i| i.pointer.hover_pos()).and_then(|mouse| {
+                mouse_pos.and_then(|mouse| {
                     sample_pixel_at(
                         mouse,
                         rect,
@@ -755,12 +856,34 @@ impl TessellatorApp {
                 None
             };
 
+            // Loupe: active when Alt is held and the cursor is over the image.
+            let alt_held = ctx.input(|i| i.modifiers.alt);
+            let (loupe_active, loupe_center_screen, loupe_center_uv) = if alt_held
+                && response.hovered()
+                && let Some(m) = mouse_pos
+                && let Some(uv) = screen_to_uv(m, rect, scale, pan)
+            {
+                (1u32, [m.x, m.y], [uv.x, uv.y])
+            } else {
+                (0u32, [0.0, 0.0], [0.0, 0.0])
+            };
+
             let settings = ShaderSettings {
                 view_matrix: view_matrix(scale, pan),
                 grayscale: self.grayscale,
                 overlay_opacity: self.overlay_opacity,
                 grid_size: self.grid_size,
                 overlay_mode: self.overlay_mode.shader_id(),
+                compare_divider: self.compare_divider,
+                compare_active: u32::from(self.compare_image.is_some()),
+                loupe_active,
+                loupe_zoom: self.loupe_zoom,
+                loupe_center_uv,
+                loupe_center_screen,
+                loupe_radius: self.loupe_radius,
+                dither: u32::from(self.dither),
+                _pad0: 0.0,
+                _pad1: 0.0,
             };
 
             let upload = if self.needs_upload {
@@ -770,10 +893,21 @@ impl TessellatorApp {
                 None
             };
 
+            let compare_upload = if self.compare_dirty {
+                self.compare_dirty = false;
+                match &self.compare_image {
+                    Some(img) => CompareUpload::Set(img.clone()),
+                    None => CompareUpload::Clear,
+                }
+            } else {
+                CompareUpload::NoChange
+            };
+
             let callback = egui_wgpu::Callback::new_paint_callback(
                 rect,
                 TessellatorCallback {
                     image: upload,
+                    compare: compare_upload,
                     settings,
                     format: self.target_format,
                 },
@@ -806,16 +940,15 @@ fn format_zoom(view: ViewState) -> String {
     }
 }
 
-/// Inverse-transform a screen-space cursor position into image pixel coords
-/// using the same scale/pan that drives the shader's view matrix, then sample
-/// mip 0. Returns `None` if the cursor is outside the image bounds.
-fn sample_pixel_at(
+/// Inverse-transform a screen-space cursor position into image UV coords using
+/// the same scale/pan that drives the shader's view matrix. Returns `None` if
+/// the cursor is outside the image bounds.
+fn screen_to_uv(
     mouse: egui::Pos2,
     rect: egui::Rect,
     scale: egui::Vec2,
     pan: egui::Vec2,
-    image: &DecodedImage,
-) -> Option<CursorSample> {
+) -> Option<egui::Vec2> {
     let center = rect.center();
     // Mouse → NDC' (screen-space NDC; egui Y is down so negate to get NDC up).
     let ndc_x = (mouse.x - center.x) / (rect.width() * 0.5);
@@ -829,9 +962,20 @@ fn sample_pixel_at(
     if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
         return None;
     }
+    Some(egui::vec2(u, v))
+}
+
+fn sample_pixel_at(
+    mouse: egui::Pos2,
+    rect: egui::Rect,
+    scale: egui::Vec2,
+    pan: egui::Vec2,
+    image: &DecodedImage,
+) -> Option<CursorSample> {
+    let uv = screen_to_uv(mouse, rect, scale, pan)?;
     let mip0 = image.mips.first()?;
-    let x = ((u * image.width as f32) as u32).min(image.width.saturating_sub(1));
-    let y = ((v * image.height as f32) as u32).min(image.height.saturating_sub(1));
+    let x = ((uv.x * image.width as f32) as u32).min(image.width.saturating_sub(1));
+    let y = ((uv.y * image.height as f32) as u32).min(image.height.saturating_sub(1));
     let idx = (y as usize * image.width as usize + x as usize) * 4;
     let rgba = [
         *mip0.rgba.get(idx)?,

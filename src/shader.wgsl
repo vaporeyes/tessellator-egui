@@ -1,5 +1,5 @@
 // ABOUTME: Fullscreen-quad shader for the photo viewport.
-// ABOUTME: Applies a 3x3 view matrix and optional grayscale + composition overlays.
+// ABOUTME: Handles view transform, compare split, loupe magnifier, overlays, dither.
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -17,11 +17,22 @@ struct Settings {
     overlay_opacity: f32,
     grid_size: f32,
     overlay_mode: u32,
+    compare_divider: f32,
+    compare_active: u32,
+    loupe_active: u32,
+    loupe_zoom: f32,
+    loupe_center_uv: vec2<f32>,
+    loupe_center_screen: vec2<f32>,
+    loupe_radius: f32,
+    dither: u32,
+    _pad0: f32,
+    _pad1: f32,
 };
 
 @group(0) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(0) @binding(1) var s_diffuse: sampler;
 @group(0) @binding(2) var<uniform> settings: Settings;
+@group(0) @binding(3) var t_compare: texture_2d<f32>;
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
@@ -46,45 +57,89 @@ fn diag_alpha(uv: vec2<f32>) -> f32 {
     return max(a1, a2);
 }
 
+// Cheap PRNG-ish noise for dither, ~triangular distribution in [-0.5, 0.5].
+fn tri_noise(p: vec2<f32>) -> f32 {
+    let n = fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    return n - 0.5;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(t_diffuse, s_diffuse, in.tex_coords);
+    // Loupe: magnify around the cursor by remapping UV inside a screen-space disc.
+    var sample_uv = in.tex_coords;
+    if (settings.loupe_active != 0u) {
+        let frag = in.clip_position.xy;
+        let d = distance(frag, settings.loupe_center_screen);
+        if (d < settings.loupe_radius) {
+            sample_uv = settings.loupe_center_uv
+                + (in.tex_coords - settings.loupe_center_uv) / settings.loupe_zoom;
+        }
+    }
+
+    // Compare: pick texture based on which side of the divider the UV is on.
+    var color: vec4<f32>;
+    if (settings.compare_active != 0u && sample_uv.x > settings.compare_divider) {
+        color = textureSample(t_compare, s_diffuse, sample_uv);
+    } else {
+        color = textureSample(t_diffuse, s_diffuse, sample_uv);
+    }
 
     let gray = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
-    let final_color = mix(color.rgb, vec3<f32>(gray), settings.grayscale);
+    var final_color = mix(color.rgb, vec3<f32>(gray), settings.grayscale);
 
+    // Composition overlays (use the original UV so they stay anchored to the
+    // image, not the magnified loupe region).
     var overlay = 0.0;
     if (settings.overlay_opacity > 0.0) {
+        let ov = in.tex_coords;
         switch settings.overlay_mode {
-            // 1 = Grid (user-controlled spacing).
             case 1u: {
-                let g = step(vec2<f32>(0.98), fract(in.tex_coords * settings.grid_size));
+                let g = step(vec2<f32>(0.98), fract(ov * settings.grid_size));
                 overlay = max(g.x, g.y);
             }
-            // 2 = Rule of thirds.
             case 2u: {
-                let v1 = line_alpha(in.tex_coords.x, 1.0 / 3.0);
-                let v2 = line_alpha(in.tex_coords.x, 2.0 / 3.0);
-                let h1 = line_alpha(in.tex_coords.y, 1.0 / 3.0);
-                let h2 = line_alpha(in.tex_coords.y, 2.0 / 3.0);
-                overlay = max(max(v1, v2), max(h1, h2));
+                overlay = max(
+                    max(line_alpha(ov.x, 1.0 / 3.0), line_alpha(ov.x, 2.0 / 3.0)),
+                    max(line_alpha(ov.y, 1.0 / 3.0), line_alpha(ov.y, 2.0 / 3.0)),
+                );
             }
-            // 3 = Golden ratio (~0.382 / 0.618).
             case 3u: {
-                let v1 = line_alpha(in.tex_coords.x, 0.382);
-                let v2 = line_alpha(in.tex_coords.x, 0.618);
-                let h1 = line_alpha(in.tex_coords.y, 0.382);
-                let h2 = line_alpha(in.tex_coords.y, 0.618);
-                overlay = max(max(v1, v2), max(h1, h2));
+                overlay = max(
+                    max(line_alpha(ov.x, 0.382), line_alpha(ov.x, 0.618)),
+                    max(line_alpha(ov.y, 0.382), line_alpha(ov.y, 0.618)),
+                );
             }
-            // 4 = Diagonal cross.
             case 4u: {
-                overlay = diag_alpha(in.tex_coords);
+                overlay = diag_alpha(ov);
             }
             default: {}
         }
         overlay *= settings.overlay_opacity;
     }
+    final_color = mix(final_color, vec3<f32>(1.0), overlay);
 
-    return vec4<f32>(mix(final_color, vec3<f32>(1.0), overlay), color.a);
+    // Compare divider line (in image UV so it stays at the split point).
+    if (settings.compare_active != 0u) {
+        let dl = line_alpha(in.tex_coords.x, settings.compare_divider);
+        final_color = mix(final_color, vec3<f32>(1.0), dl * 0.6);
+    }
+
+    // Loupe edge ring (in screen pixels so it's a constant 1.5 px wide).
+    if (settings.loupe_active != 0u) {
+        let frag = in.clip_position.xy;
+        let edge = abs(distance(frag, settings.loupe_center_screen) - settings.loupe_radius);
+        if (edge < 1.5) {
+            let t = 1.0 - edge / 1.5;
+            final_color = mix(final_color, vec3<f32>(1.0), t * 0.8);
+        }
+    }
+
+    // Dither to break up subtle banding from grayscale + overlay blends when
+    // quantizing back down to 8-bit at scanout. Cost: one sin + one fract.
+    if (settings.dither != 0u) {
+        let n = tri_noise(in.clip_position.xy) / 255.0;
+        final_color = final_color + vec3<f32>(n);
+    }
+
+    return vec4<f32>(final_color, color.a);
 }
