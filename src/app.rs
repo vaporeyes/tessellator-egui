@@ -9,9 +9,13 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::cache::ImageCache;
 use crate::gpu::{ShaderSettings, TessellatorCallback};
-use crate::io::{self, Message};
+use crate::io::{self, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
+
+/// Maximum bytes of decoded image data held in the LRU cache (~512 MB).
+const CACHE_CAP_BYTES: usize = 512 * 1024 * 1024;
 
 pub struct FileEntry {
     pub path: PathBuf,
@@ -31,10 +35,21 @@ pub struct TessellatorApp {
     /// outcome. Prevents repeated retries of broken files.
     requested_thumbnails: HashSet<PathBuf>,
 
-    /// Monotonic counter incremented on every high-res request. Decoded results
-    /// arriving with a stale generation are discarded.
+    /// Paths with a high-res decode currently in flight. Used to avoid
+    /// duplicate Preload requests; Display requests are issued unconditionally
+    /// and disambiguated by generation.
+    pending_image_requests: HashSet<PathBuf>,
+
+    /// Decoded images cached for instant re-display on neighbor navigation.
+    image_cache: ImageCache,
+
+    /// Monotonic counter incremented on every Display request. Decoded results
+    /// arriving with a stale generation are not shown (but are still cached).
     high_res_generation: u64,
     last_load_error: Option<String>,
+
+    /// Sidebar should scroll to center this row index on the next frame.
+    pending_scroll_to_index: Option<usize>,
 
     target_format: wgpu::TextureFormat,
 
@@ -64,8 +79,11 @@ impl TessellatorApp {
             receiver,
             sender,
             requested_thumbnails: HashSet::new(),
+            pending_image_requests: HashSet::new(),
+            image_cache: ImageCache::new(CACHE_CAP_BYTES),
             high_res_generation: 0,
             last_load_error: None,
+            pending_scroll_to_index: None,
             target_format,
             grayscale: 0.0,
             grid_opacity: 0.0,
@@ -76,18 +94,53 @@ impl TessellatorApp {
         }
     }
 
+    /// Display the given image in the viewport (and reset to fit-to-screen).
+    fn show_image(&mut self, image: Arc<image::DynamicImage>) {
+        self.current_image_size = Some([image.width(), image.height()]);
+        self.pending_high_res = Some(image);
+        self.view = ViewState::FitOnNextFrame;
+    }
+
     fn select_image(&mut self, index: usize, ctx: &egui::Context) {
+        if index >= self.files.len() {
+            return;
+        }
         let path = self.files[index].path.clone();
         log::info!("Selected: {}", self.files[index].name);
         self.selected_index = Some(index);
         self.high_res_generation = self.high_res_generation.wrapping_add(1);
         self.last_load_error = None;
-        io::request_high_res(
-            path,
-            self.high_res_generation,
-            self.sender.clone(),
-            ctx.clone(),
-        );
+        self.pending_scroll_to_index = Some(index);
+
+        if let Some(image) = self.image_cache.get(&path) {
+            log::debug!("Cache hit: {:?}", path.file_name().unwrap_or_default());
+            self.show_image(image);
+        } else {
+            self.pending_image_requests.insert(path.clone());
+            io::request_image(
+                path,
+                ImagePurpose::Display { generation: self.high_res_generation },
+                self.sender.clone(),
+                ctx.clone(),
+            );
+        }
+
+        self.preload_neighbors(ctx);
+    }
+
+    /// Issue Preload requests for the images immediately before and after the
+    /// current selection, skipping anything already cached or in flight.
+    fn preload_neighbors(&mut self, ctx: &egui::Context) {
+        let Some(current) = self.selected_index else { return };
+        let neighbors = [current.checked_sub(1), Some(current + 1).filter(|&i| i < self.files.len())];
+        for n in neighbors.into_iter().flatten() {
+            let path = self.files[n].path.clone();
+            if self.image_cache.contains(&path) || self.pending_image_requests.contains(&path) {
+                continue;
+            }
+            self.pending_image_requests.insert(path.clone());
+            io::request_image(path, ImagePurpose::Preload, self.sender.clone(), ctx.clone());
+        }
     }
 
     fn drain_messages(&mut self, ctx: &egui::Context) {
@@ -116,31 +169,94 @@ impl TessellatorApp {
                 Message::ThumbnailFailed => {
                     // Path stays in requested_thumbnails so we don't retry.
                 }
-                Message::HighResLoaded { generation, image } => {
-                    if generation != self.high_res_generation {
-                        log::debug!(
-                            "Discarding stale high-res result (gen {} != {})",
-                            generation,
-                            self.high_res_generation
-                        );
-                        continue;
+                Message::ImageDecoded { path, image, purpose } => {
+                    self.pending_image_requests.remove(&path);
+                    self.image_cache.insert(path.clone(), image.clone());
+                    match purpose {
+                        ImagePurpose::Display { generation } => {
+                            if generation != self.high_res_generation {
+                                log::debug!(
+                                    "Discarding stale Display result (gen {} != {})",
+                                    generation,
+                                    self.high_res_generation
+                                );
+                                continue;
+                            }
+                            log::debug!("High-res ready: {}x{}", image.width(), image.height());
+                            self.show_image(image);
+                        }
+                        ImagePurpose::Preload => {
+                            // Cached above; if the user has since navigated to
+                            // this image, surface it now.
+                            if let Some(i) = self.selected_index
+                                && self.files.get(i).map(|f| &f.path) == Some(&path)
+                                && self.current_image_size.is_none_or(|sz| {
+                                    sz != [image.width(), image.height()]
+                                })
+                            {
+                                self.show_image(image);
+                            }
+                        }
                     }
-                    log::debug!("High-res ready: {}x{}", image.width(), image.height());
-                    self.current_image_size = Some([image.width(), image.height()]);
-                    self.pending_high_res = Some(image);
-                    self.view = ViewState::FitOnNextFrame;
                 }
-                Message::HighResFailed { generation, path, error } => {
-                    if generation != self.high_res_generation {
-                        continue;
+                Message::ImageFailed { path, error, purpose } => {
+                    self.pending_image_requests.remove(&path);
+                    if let ImagePurpose::Display { generation } = purpose {
+                        if generation != self.high_res_generation {
+                            continue;
+                        }
+                        self.last_load_error = Some(format!(
+                            "Failed to load {}: {}",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            error
+                        ));
                     }
-                    self.last_load_error = Some(format!(
-                        "Failed to load {}: {}",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        error
-                    ));
                 }
             }
+        }
+    }
+
+    /// Read keyboard navigation keys and act on them. Uses `consume_key` so a
+    /// focused slider doesn't also see the press.
+    fn handle_keyboard_nav(&mut self, ctx: &egui::Context) {
+        if self.files.is_empty() {
+            return;
+        }
+        let last = self.files.len() - 1;
+        let current = self.selected_index;
+
+        let (left, right, home, end, page_up, page_down, space) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::End),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
+            )
+        });
+
+        let target = if home {
+            Some(0)
+        } else if end {
+            Some(last)
+        } else if left {
+            Some(current.map_or(0, |i| i.saturating_sub(1)))
+        } else if right || space {
+            Some(current.map_or(0, |i| (i + 1).min(last)))
+        } else if page_up {
+            Some(current.map_or(0, |i| i.saturating_sub(10)))
+        } else if page_down {
+            Some(current.map_or(0, |i| (i + 10).min(last)))
+        } else {
+            None
+        };
+
+        if let Some(i) = target
+            && Some(i) != current
+        {
+            self.select_image(i, ctx);
         }
     }
 }
@@ -148,6 +264,7 @@ impl TessellatorApp {
 impl eframe::App for TessellatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages(ctx);
+        self.handle_keyboard_nav(ctx);
         self.show_sidebar(ctx);
         self.show_tools_panel(ctx);
         self.show_viewport(ctx);
@@ -159,6 +276,7 @@ impl TessellatorApp {
         let mut clicked: Option<usize> = None;
         let mut to_request: Vec<PathBuf> = Vec::new();
         let mut open_folder: Option<PathBuf> = None;
+        let pending_scroll = self.pending_scroll_to_index.take();
 
         egui::SidePanel::left("sidebar")
             .resizable(true)
@@ -173,39 +291,44 @@ impl TessellatorApp {
                 ui.separator();
 
                 let row_height = 40.0;
-                egui::ScrollArea::vertical().show_rows(
-                    ui,
-                    row_height,
-                    self.files.len(),
-                    |ui, row_range| {
-                        for i in row_range.clone() {
-                            let entry = &self.files[i];
-                            let is_selected = self.selected_index == Some(i);
-                            let response = ui
-                                .horizontal(|ui| {
-                                    if let Some(texture) = &entry.thumbnail {
-                                        ui.image((texture.id(), egui::vec2(32.0, 32.0)));
-                                    } else {
-                                        ui.allocate_space(egui::vec2(32.0, 32.0));
-                                    }
-                                    ui.selectable_label(is_selected, &entry.name)
-                                })
-                                .inner;
-                            if response.clicked() {
-                                clicked = Some(i);
-                            }
+                let viewport_h = ui.available_height();
+
+                let mut scroll = egui::ScrollArea::vertical();
+                if let Some(i) = pending_scroll {
+                    let target = (i as f32) * row_height
+                        - viewport_h * 0.5
+                        + row_height * 0.5;
+                    scroll = scroll.vertical_scroll_offset(target.max(0.0));
+                }
+
+                scroll.show_rows(ui, row_height, self.files.len(), |ui, row_range| {
+                    for i in row_range.clone() {
+                        let entry = &self.files[i];
+                        let is_selected = self.selected_index == Some(i);
+                        let response = ui
+                            .horizontal(|ui| {
+                                if let Some(texture) = &entry.thumbnail {
+                                    ui.image((texture.id(), egui::vec2(32.0, 32.0)));
+                                } else {
+                                    ui.allocate_space(egui::vec2(32.0, 32.0));
+                                }
+                                ui.selectable_label(is_selected, &entry.name)
+                            })
+                            .inner;
+                        if response.clicked() {
+                            clicked = Some(i);
                         }
-                        // Only request thumbnails for currently-visible rows.
-                        for i in row_range {
-                            let entry = &self.files[i];
-                            if entry.thumbnail.is_none()
-                                && !self.requested_thumbnails.contains(&entry.path)
-                            {
-                                to_request.push(entry.path.clone());
-                            }
+                    }
+                    // Only request thumbnails for currently-visible rows.
+                    for i in row_range {
+                        let entry = &self.files[i];
+                        if entry.thumbnail.is_none()
+                            && !self.requested_thumbnails.contains(&entry.path)
+                        {
+                            to_request.push(entry.path.clone());
                         }
-                    },
-                );
+                    }
+                });
             });
 
         if let Some(path) = open_folder {
@@ -213,6 +336,7 @@ impl TessellatorApp {
             self.files.clear();
             self.selected_index = None;
             self.requested_thumbnails.clear();
+            self.pending_image_requests.clear();
             io::scan_folder(path, self.sender.clone(), ctx.clone());
         }
 
@@ -252,7 +376,7 @@ impl TessellatorApp {
 
             if self.selected_index.is_none() {
                 ui.heading("Viewer");
-                ui.label("Select an image to view.");
+                ui.label("Select an image to view, or use the arrow keys to navigate.");
                 return;
             }
 
@@ -266,7 +390,6 @@ impl TessellatorApp {
             let response = ui.interact(rect, ui.id(), egui::Sense::drag());
             let screen = rect.size();
 
-            // Resolve fit-to-screen now that we know the viewport size.
             if matches!(self.view, ViewState::FitOnNextFrame) {
                 let zoom = (screen.x / img_w).min(screen.y / img_h);
                 self.view = ViewState::Manual { zoom, pan: egui::Vec2::ZERO };
@@ -276,8 +399,6 @@ impl TessellatorApp {
                 return;
             };
 
-            // Only consume scroll when the pointer is over the viewport so the
-            // file list keeps its own scroll input.
             if response.hovered() {
                 let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll_delta != 0.0 {
@@ -287,7 +408,6 @@ impl TessellatorApp {
                             (mouse_pos.x - rect.center().x) / (rect.width() * 0.5),
                             (mouse_pos.y - rect.center().y) / (rect.height() * 0.5),
                         );
-                        // Pan_new = Mouse_ndc + (Pan_old - Mouse_ndc) * zoom_factor
                         pan = mouse_ndc + (pan - mouse_ndc) * zoom_factor;
                     }
                     zoom *= zoom_factor;

@@ -7,12 +7,28 @@ use image::DynamicImage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Why an image was decoded. `Display` results drive the viewport (subject to
+/// generation matching); `Preload` results only populate the cache.
+#[derive(Debug, Clone, Copy)]
+pub enum ImagePurpose {
+    Display { generation: u64 },
+    Preload,
+}
+
 pub enum Message {
     FilesFound(Vec<PathBuf>),
     ThumbnailLoaded { path: PathBuf, image: egui::ColorImage },
     ThumbnailFailed,
-    HighResLoaded { generation: u64, image: Arc<DynamicImage> },
-    HighResFailed { generation: u64, path: PathBuf, error: String },
+    ImageDecoded {
+        path: PathBuf,
+        image: Arc<DynamicImage>,
+        purpose: ImagePurpose,
+    },
+    ImageFailed {
+        path: PathBuf,
+        error: String,
+        purpose: ImagePurpose,
+    },
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
@@ -66,31 +82,32 @@ pub fn request_thumbnail(path: PathBuf, sender: Sender<Message>, ctx: egui::Cont
     });
 }
 
-pub fn request_high_res(
+pub fn request_image(
     path: PathBuf,
-    generation: u64,
+    purpose: ImagePurpose,
     sender: Sender<Message>,
     ctx: egui::Context,
 ) {
     rayon::spawn(move || {
         log::debug!(
-            "High-res decode start (gen {}): {:?}",
-            generation,
+            "Image decode start ({:?}): {:?}",
+            purpose,
             path.file_name().unwrap_or_default()
         );
         match image::open(&path) {
             Ok(img) => {
-                let _ = sender.send(Message::HighResLoaded {
-                    generation,
+                let _ = sender.send(Message::ImageDecoded {
+                    path,
                     image: Arc::new(img),
+                    purpose,
                 });
             }
             Err(e) => {
-                log::error!("High-res decode failed for {:?}: {}", path, e);
-                let _ = sender.send(Message::HighResFailed {
-                    generation,
+                log::error!("Image decode failed for {:?}: {}", path, e);
+                let _ = sender.send(Message::ImageFailed {
                     path,
                     error: e.to_string(),
+                    purpose,
                 });
             }
         }

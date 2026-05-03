@@ -2,6 +2,7 @@
 // ABOUTME: All application logic lives in the app module.
 
 mod app;
+mod cache;
 mod gpu;
 mod io;
 mod view;
