@@ -70,6 +70,9 @@ RUST_LOG=debug cargo run --release
 |---|---|
 | `Cmd+O` / `Ctrl+O` | Open folder picker |
 | `Cmd+R` / `Ctrl+R` | Re-scan current folder (preserves selection) |
+| `Cmd+C` / `Ctrl+C` | Copy current image's path to clipboard |
+
+The sidebar's "Recent" button shows the last few folders you've opened.
 
 ## Mouse
 

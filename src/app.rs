@@ -138,6 +138,9 @@ pub struct TessellatorApp {
     /// (set by keyboard zoom-step shortcuts).
     pending_zoom_step: Option<f32>,
 
+    /// Most-recently-opened folders, MRU first, capped at `RECENT_FOLDERS_MAX`.
+    recent_folders: Vec<PathBuf>,
+
     /// Pixel under the cursor in the viewport (image coords + RGBA), updated
     /// each frame. Drives the eyedropper readout in the status bar.
     cursor_pixel: Option<CursorSample>,
@@ -169,7 +172,11 @@ struct PersistentState {
     loupe_zoom: Option<f32>,
     loupe_radius: Option<f32>,
     dither: Option<bool>,
+    #[serde(default)]
+    recent_folders: Vec<PathBuf>,
 }
+
+const RECENT_FOLDERS_MAX: usize = 8;
 
 impl TessellatorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -218,6 +225,7 @@ impl TessellatorApp {
             loupe_radius: saved.loupe_radius.unwrap_or(120.0),
             dither: saved.dither.unwrap_or(true),
             pending_zoom_step: None,
+            recent_folders: saved.recent_folders,
             cursor_pixel: None,
             folder_watcher: None,
             folder_refresh_at: None,
@@ -235,6 +243,7 @@ impl TessellatorApp {
 
     fn open_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.folder_path = Some(path.clone());
+        self.push_recent_folder(path.clone());
         self.files.clear();
         self.selected_index = None;
         self.requested_thumbnails.clear();
@@ -246,6 +255,7 @@ impl TessellatorApp {
         self.needs_upload = false;
         self.cursor_pixel = None;
         self.clear_compare();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("Tessellator".to_string()));
         io::scan_folder(
             path.clone(),
             self.recursion_depth,
@@ -265,6 +275,13 @@ impl TessellatorApp {
             Ok(w) => self.folder_watcher = Some(w),
             Err(e) => log::warn!("Failed to start folder watcher for {:?}: {}", path, e),
         }
+    }
+
+    /// Move `path` to the front of the MRU list, deduping and capping length.
+    fn push_recent_folder(&mut self, path: PathBuf) {
+        self.recent_folders.retain(|p| p != &path);
+        self.recent_folders.insert(0, path);
+        self.recent_folders.truncate(RECENT_FOLDERS_MAX);
     }
 
     fn start_compare(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -362,6 +379,10 @@ impl TessellatorApp {
         self.high_res_generation = self.high_res_generation.wrapping_add(1);
         self.last_load_error = None;
         self.pending_scroll_to_index = Some(index);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+            "Tessellator - {}",
+            self.files[index].name
+        )));
 
         if let Some(image) = self.image_cache.get(&path) {
             log::debug!("Cache hit: {:?}", path.file_name().unwrap_or_default());
@@ -400,14 +421,7 @@ impl TessellatorApp {
             _ => 0,
         };
 
-        self.direction_streak = if signed_step == 0 {
-            0
-        } else if signed_step.signum() == self.direction_streak.signum() {
-            self.direction_streak.saturating_add(signed_step)
-        } else {
-            // Direction change: start a fresh streak in the new direction.
-            signed_step
-        };
+        self.direction_streak = next_streak(self.direction_streak, signed_step);
         self.last_select_time = Some(now);
     }
 
@@ -625,6 +639,13 @@ impl TessellatorApp {
         if p.escape {
             self.clear_compare();
         }
+        if p.copy_path
+            && let Some(entry) = self.selected_index.and_then(|i| self.files.get(i))
+        {
+            let s = entry.path.to_string_lossy().into_owned();
+            log::debug!("Copied path to clipboard: {}", s);
+            ctx.copy_text(s);
+        }
 
         // View mode.
         if p.fit {
@@ -725,6 +746,7 @@ impl eframe::App for TessellatorApp {
             loupe_zoom: Some(self.loupe_zoom),
             loupe_radius: Some(self.loupe_radius),
             dither: Some(self.dither),
+            recent_folders: self.recent_folders.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -751,6 +773,23 @@ impl TessellatorApp {
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
                     {
                         open_folder = Some(path);
+                    }
+                    if !self.recent_folders.is_empty() {
+                        ui.menu_button("Recent", |ui| {
+                            for path in self.recent_folders.clone() {
+                                let label = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                let resp = ui
+                                    .button(label)
+                                    .on_hover_text(path.display().to_string());
+                                if resp.clicked() {
+                                    open_folder = Some(path);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                     }
                     ui.label("Depth:");
                     let r = ui.add(
@@ -1031,7 +1070,8 @@ impl TessellatorApp {
             let scale = egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y);
             let mouse_pos = ui.input(|i| i.pointer.hover_pos());
 
-            // Eyedropper: sample the pixel under the cursor.
+            // Eyedropper: sample the pixel under the cursor at the mip the
+            // GPU is closest to displaying.
             self.cursor_pixel = if response.hovered() {
                 mouse_pos.and_then(|mouse| {
                     sample_pixel_at(
@@ -1039,6 +1079,7 @@ impl TessellatorApp {
                         rect,
                         scale,
                         pan,
+                        zoom,
                         self.current_image.as_deref()?,
                     )
                 })
@@ -1146,10 +1187,14 @@ struct Pressed {
     zoom_out: bool,
     // Tools
     toggle_grayscale: bool,
+    copy_path: bool,
 }
 
 fn read_pressed_keys(ctx: &egui::Context) -> Pressed {
     use egui::{Key, Modifiers};
+    // Don't steal Cmd+C if any widget has keyboard focus (text fields, value
+    // editors, etc.) - they want it for their own copy behavior.
+    let any_focused = ctx.memory(|m| m.focused().is_some());
     ctx.input_mut(|i| {
         let space = i.consume_key(Modifiers::NONE, Key::Space);
         Pressed {
@@ -1176,8 +1221,22 @@ fn read_pressed_keys(ctx: &egui::Context) -> Pressed {
             zoom_out: i.consume_key(Modifiers::NONE, Key::Minus),
 
             toggle_grayscale: i.consume_key(Modifiers::NONE, Key::G),
+            copy_path: !any_focused && i.consume_key(Modifiers::COMMAND, Key::C),
         }
     })
+}
+
+/// Pure transition function for the direction-streak state machine. Extracted
+/// from `update_direction_streak` so it can be tested without an `App` instance.
+fn next_streak(prev_streak: i32, signed_step: i32) -> i32 {
+    if signed_step == 0 {
+        0
+    } else if signed_step.signum() == prev_streak.signum() {
+        prev_streak.saturating_add(signed_step)
+    } else {
+        // Direction change (or fresh start from 0): begin a new streak.
+        signed_step
+    }
 }
 
 fn format_zoom(view: ViewState) -> String {
@@ -1218,18 +1277,131 @@ fn sample_pixel_at(
     rect: egui::Rect,
     scale: egui::Vec2,
     pan: egui::Vec2,
+    zoom: f32,
     image: &DecodedImage,
 ) -> Option<CursorSample> {
     let uv = screen_to_uv(mouse, rect, scale, pan)?;
-    let mip0 = image.mips.first()?;
+
+    // Pick the mip level the GPU is closest to displaying so the readout
+    // matches the on-screen color rather than mip-0 detail invisible at
+    // low zoom. zoom=1 -> mip 0, zoom=0.5 -> mip 1, zoom=0.25 -> mip 2, etc.
+    let lod = if zoom >= 1.0 {
+        0
+    } else {
+        ((-zoom.log2()).floor() as usize).min(image.mips.len().saturating_sub(1))
+    };
+    let mip = image.mips.get(lod)?;
+    let mx = ((uv.x * mip.width as f32) as u32).min(mip.width.saturating_sub(1));
+    let my = ((uv.y * mip.height as f32) as u32).min(mip.height.saturating_sub(1));
+    let idx = (my as usize * mip.width as usize + mx as usize) * 4;
+    let rgba = [
+        *mip.rgba.get(idx)?,
+        *mip.rgba.get(idx + 1)?,
+        *mip.rgba.get(idx + 2)?,
+        *mip.rgba.get(idx + 3)?,
+    ];
+    // Report the original-image coordinate so the readout doesn't shift as
+    // the user zooms.
     let x = ((uv.x * image.width as f32) as u32).min(image.width.saturating_sub(1));
     let y = ((uv.y * image.height as f32) as u32).min(image.height.saturating_sub(1));
-    let idx = (y as usize * image.width as usize + x as usize) * 4;
-    let rgba = [
-        *mip0.rgba.get(idx)?,
-        *mip0.rgba.get(idx + 1)?,
-        *mip0.rgba.get(idx + 2)?,
-        *mip0.rgba.get(idx + 3)?,
-    ];
     Some(CursorSample { x, y, rgba })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))
+    }
+
+    #[test]
+    fn screen_to_uv_center_at_identity() {
+        // scale=1, pan=0: center of screen → center of image.
+        let uv = screen_to_uv(
+            egui::pos2(100.0, 100.0),
+            rect(200.0, 200.0),
+            egui::vec2(1.0, 1.0),
+            egui::Vec2::ZERO,
+        )
+        .unwrap();
+        assert!((uv.x - 0.5).abs() < 1e-5);
+        assert!((uv.y - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn screen_to_uv_outside_returns_none() {
+        // scale=0.5: image fills only half the screen. The screen's top-left
+        // corner is well outside the image bounds.
+        let uv = screen_to_uv(
+            egui::pos2(0.0, 0.0),
+            rect(200.0, 200.0),
+            egui::vec2(0.5, 0.5),
+            egui::Vec2::ZERO,
+        );
+        assert!(uv.is_none());
+    }
+
+    #[test]
+    fn screen_to_uv_pan_shifts_origin() {
+        // pan.x = -0.5 shifts the image left in NDC. Center of screen now
+        // sees a UV further toward the right of the image.
+        // vx = (0 - (-0.5)) / 1 = 0.5  →  u = (0.5 + 1) / 2 = 0.75
+        let uv = screen_to_uv(
+            egui::pos2(100.0, 100.0),
+            rect(200.0, 200.0),
+            egui::vec2(1.0, 1.0),
+            egui::vec2(-0.5, 0.0),
+        )
+        .unwrap();
+        assert!((uv.x - 0.75).abs() < 1e-5, "got {}", uv.x);
+        assert!((uv.y - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn screen_to_uv_zoom_keeps_center_at_center() {
+        // 2x zoom expands the image off-screen but the center pixel still maps
+        // to UV (0.5, 0.5).
+        let uv = screen_to_uv(
+            egui::pos2(100.0, 100.0),
+            rect(200.0, 200.0),
+            egui::vec2(2.0, 2.0),
+            egui::Vec2::ZERO,
+        )
+        .unwrap();
+        assert!((uv.x - 0.5).abs() < 1e-5);
+        assert!((uv.y - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn streak_starts_from_zero() {
+        assert_eq!(next_streak(0, 1), 1);
+        assert_eq!(next_streak(0, -1), -1);
+        assert_eq!(next_streak(0, 0), 0);
+    }
+
+    #[test]
+    fn streak_extends_in_same_direction() {
+        assert_eq!(next_streak(1, 1), 2);
+        assert_eq!(next_streak(5, 1), 6);
+        assert_eq!(next_streak(-3, -1), -4);
+    }
+
+    #[test]
+    fn streak_resets_on_reverse() {
+        assert_eq!(next_streak(5, -1), -1);
+        assert_eq!(next_streak(-2, 1), 1);
+    }
+
+    #[test]
+    fn streak_collapses_on_pause() {
+        assert_eq!(next_streak(10, 0), 0);
+        assert_eq!(next_streak(-7, 0), 0);
+    }
+
+    #[test]
+    fn streak_saturates_at_i32_bounds() {
+        assert_eq!(next_streak(i32::MAX, 1), i32::MAX);
+        assert_eq!(next_streak(i32::MIN, -1), i32::MIN);
+    }
 }

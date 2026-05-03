@@ -571,3 +571,138 @@ pub fn request_image(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Naive bytewise reference implementation. Sums each channel separately
+    /// and divides by 4 — what `avg_4_u32` and `avg_4_u32x8` must produce.
+    fn ref_avg(p00: u32, p01: u32, p10: u32, p11: u32) -> u32 {
+        let extract = |p: u32| {
+            [
+                (p & 0xFF) as u32,
+                ((p >> 8) & 0xFF) as u32,
+                ((p >> 16) & 0xFF) as u32,
+                ((p >> 24) & 0xFF) as u32,
+            ]
+        };
+        let a = extract(p00);
+        let b = extract(p01);
+        let c = extract(p10);
+        let d = extract(p11);
+        let r = (a[0] + b[0] + c[0] + d[0]) / 4;
+        let g = (a[1] + b[1] + c[1] + d[1]) / 4;
+        let bl = (a[2] + b[2] + c[2] + d[2]) / 4;
+        let al = (a[3] + b[3] + c[3] + d[3]) / 4;
+        r | (g << 8) | (bl << 16) | (al << 24)
+    }
+
+    #[test]
+    fn avg_scalar_matches_reference() {
+        let cases = [
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF),
+            (0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000),
+            (0xABCD_EF12, 0x3456_789A, 0xBCDE_F011, 0x2233_4455),
+            (0xFF00_FF00, 0x00FF_00FF, 0xFFFF_0000, 0x0000_FFFF),
+            (0x8080_8080, 0x8080_8080, 0x8080_8080, 0x8080_8080),
+        ];
+        for (a, b, c, d) in cases {
+            assert_eq!(
+                avg_4_u32(a, b, c, d),
+                ref_avg(a, b, c, d),
+                "inputs: {:08x} {:08x} {:08x} {:08x}",
+                a,
+                b,
+                c,
+                d
+            );
+        }
+    }
+
+    #[test]
+    fn avg_simd_matches_scalar_per_lane() {
+        // Build 8 lanes of varied per-pixel values and verify the SIMD
+        // implementation produces the same result lane-wise.
+        let mut p00 = [0u32; 8];
+        let mut p01 = [0u32; 8];
+        let mut p10 = [0u32; 8];
+        let mut p11 = [0u32; 8];
+        for i in 0..8 {
+            let k = i as u32;
+            p00[i] = (k.wrapping_mul(0x0123_4567)).wrapping_add(0x1111_1111);
+            p01[i] = 0xFFAA_5500 ^ k.wrapping_mul(31);
+            p10[i] = (k.wrapping_mul(0x1020_3040)).wrapping_add(7);
+            p11[i] = u32::MAX.wrapping_sub(k.wrapping_mul(0x1122_3344));
+        }
+        let simd = avg_4_u32x8(
+            u32x8::from(p00),
+            u32x8::from(p01),
+            u32x8::from(p10),
+            u32x8::from(p11),
+        );
+        let lanes = simd.to_array();
+        for i in 0..8 {
+            assert_eq!(
+                lanes[i],
+                avg_4_u32(p00[i], p01[i], p10[i], p11[i]),
+                "lane {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn downsample_box_2x2_red() {
+        let src = vec![
+            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255,
+        ];
+        let mip = downsample_box(&src, 2, 2);
+        assert_eq!(mip.width, 1);
+        assert_eq!(mip.height, 1);
+        assert_eq!(mip.rgba, vec![255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn downsample_box_averages_correctly() {
+        // R values 0, 100, 200, 200 → avg 125.  Alpha all 255.
+        let src = vec![
+            0, 0, 0, 255, 100, 0, 0, 255,
+            200, 0, 0, 255, 200, 0, 0, 255,
+        ];
+        let mip = downsample_box(&src, 2, 2);
+        assert_eq!(mip.rgba[0], 125, "R channel average");
+        assert_eq!(mip.rgba[3], 255, "alpha preserved");
+    }
+
+    #[test]
+    fn downsample_box_clamps_when_src_height_is_one() {
+        // src_h=1 forces sy1 to clamp to row 0 (= sy0). Both top and bot
+        // resolve to row 0, so each pixel contributes twice.
+        let src = vec![10, 20, 30, 255, 40, 50, 60, 255];
+        let mip = downsample_box(&src, 2, 1);
+        assert_eq!(mip.width, 1);
+        assert_eq!(mip.height, 1);
+        // R: (10 + 40 + 10 + 40) / 4 = 25
+        assert_eq!(mip.rgba[0], 25);
+    }
+
+    #[test]
+    fn is_jpeg_magic_bytes() {
+        assert!(is_jpeg(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(is_jpeg(&[0xFF, 0xD8, 0xFF, 0xDB]));
+        assert!(!is_jpeg(&[0x89, 0x50, 0x4E, 0x47]), "PNG should not match");
+        assert!(!is_jpeg(&[]), "empty");
+        assert!(!is_jpeg(&[0xFF, 0xD8]), "too short");
+    }
+
+    #[test]
+    fn cancel_token_observes_cancellation() {
+        let t = CancelToken::new();
+        assert!(!t.is_cancelled());
+        let t2 = t.clone();
+        t2.cancel();
+        assert!(t.is_cancelled(), "cancellation must be visible across clones");
+    }
+}

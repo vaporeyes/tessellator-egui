@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Tracked debt
+
+See [TODO.md](TODO.md) for known bugs that haven't fired yet, deferred features
+(HDR, manual rotation, delete/rename), architecture risks, and quick UX wins
+that have been identified but not done. Update it when you defer something
+non-trivial.
+
 ## Commands
 
 - Build: `cargo build` (release: `cargo build --release`)
