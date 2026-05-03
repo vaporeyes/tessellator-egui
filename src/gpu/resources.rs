@@ -1,8 +1,8 @@
 // ABOUTME: WGPU pipeline, vertex buffer, sampler, and texture upload for the viewer.
 // ABOUTME: ShaderSettings is the uniform buffer matching the WGSL Settings struct.
 
+use crate::io::DecodedImage;
 use eframe::wgpu;
-use image::DynamicImage;
 use wgpu::util::DeviceExt;
 
 const SHADER_SOURCE: &str = include_str!("../shader.wgsl");
@@ -12,9 +12,10 @@ const SHADER_SOURCE: &str = include_str!("../shader.wgsl");
 pub struct ShaderSettings {
     pub view_matrix: [f32; 12],
     pub grayscale: f32,
-    pub grid_opacity: f32,
+    pub overlay_opacity: f32,
     pub grid_size: f32,
-    pub padding: f32,
+    /// 0 = none, 1 = grid, 2 = rule of thirds, 3 = golden ratio, 4 = diagonal.
+    pub overlay_mode: u32,
 }
 
 // 3 columns of mat3x3<f32> padded to 16B each (48B) plus four f32 scalars (16B).
@@ -124,6 +125,7 @@ impl TessellatorResources {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -162,21 +164,22 @@ impl TessellatorResources {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        image: &DynamicImage,
+        image: &DecodedImage,
     ) {
-        log::info!("Uploading texture: {}x{}", image.width(), image.height());
-        let rgba = image.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        let size = wgpu::Extent3d {
+        let width = image.width;
+        let height = image.height;
+        let mip_level_count = image.mips.len() as u32;
+        log::info!(
+            "Uploading texture: {}x{} ({} mip levels)",
             width,
             height,
-            depth_or_array_layers: 1,
-        };
+            mip_level_count
+        );
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tessellator.high_res_texture"),
-            size,
-            mip_level_count: 1,
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
@@ -184,21 +187,9 @@ impl TessellatorResources {
             view_formats: &[],
         });
 
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: None,
-            },
-            size,
-        );
+        for (level, mip) in image.mips.iter().enumerate() {
+            upload_mip(queue, &texture, level as u32, &mip.rgba, mip.width, mip.height);
+        }
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -238,4 +229,29 @@ impl TessellatorResources {
     pub fn current_bind_group(&self) -> Option<&wgpu::BindGroup> {
         self.current_texture.as_ref().map(|(_, bg, _)| bg)
     }
+}
+
+fn upload_mip(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    level: u32,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: None,
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
 }

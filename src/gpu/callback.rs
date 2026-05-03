@@ -2,13 +2,13 @@
 // ABOUTME: any pending high-res image before drawing the textured viewport quad.
 
 use eframe::wgpu;
-use image::DynamicImage;
 use std::sync::Arc;
 
 use super::resources::{ShaderSettings, TessellatorResources};
+use crate::io::DecodedImage;
 
 pub struct TessellatorCallback {
-    pub image: Option<Arc<DynamicImage>>,
+    pub image: Option<Arc<DecodedImage>>,
     pub settings: ShaderSettings,
     pub format: wgpu::TextureFormat,
 }

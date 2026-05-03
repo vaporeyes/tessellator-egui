@@ -1,14 +1,14 @@
 // ABOUTME: LRU cache of decoded images keyed by path, capped by total bytes.
 // ABOUTME: Used to make keyboard navigation between neighboring images instant.
 
-use image::DynamicImage;
+use crate::io::DecodedImage;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 struct Entry {
     path: PathBuf,
-    image: Arc<DynamicImage>,
+    image: Arc<DecodedImage>,
     bytes: usize,
 }
 
@@ -34,7 +34,7 @@ impl ImageCache {
     }
 
     /// Look up an image. On hit, promotes the entry to most-recently-used.
-    pub fn get(&mut self, path: &Path) -> Option<Arc<DynamicImage>> {
+    pub fn get(&mut self, path: &Path) -> Option<Arc<DecodedImage>> {
         let pos = self.entries.iter().position(|e| e.path == path)?;
         let entry = self.entries.remove(pos)?;
         let image = entry.image.clone();
@@ -42,13 +42,13 @@ impl ImageCache {
         Some(image)
     }
 
-    pub fn insert(&mut self, path: PathBuf, image: Arc<DynamicImage>) {
+    pub fn insert(&mut self, path: PathBuf, image: Arc<DecodedImage>) {
         if self.contains(&path) {
             // Already cached; just promote.
             let _ = self.get(&path);
             return;
         }
-        let bytes = estimate_bytes(&image);
+        let bytes = image.byte_size();
         self.entries.push_front(Entry { path, image, bytes });
         self.bytes += bytes;
         self.evict_to_cap();
@@ -63,9 +63,4 @@ impl ImageCache {
             }
         }
     }
-}
-
-fn estimate_bytes(image: &DynamicImage) -> usize {
-    // RGBA upper bound; close enough for cache budgeting.
-    (image.width() as usize) * (image.height() as usize) * 4
 }

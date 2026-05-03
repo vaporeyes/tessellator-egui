@@ -11,7 +11,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::cache::ImageCache;
 use crate::gpu::{ShaderSettings, TessellatorCallback};
-use crate::io::{self, ImagePurpose, Message};
+use crate::io::{self, DecodedImage, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
 
 /// Maximum bytes of decoded image data held in the LRU cache (~512 MB).
@@ -26,6 +26,38 @@ pub struct FileEntry {
 
 /// Default folder-scan recursion depth. 1 = the folder itself only.
 const DEFAULT_RECURSION_DEPTH: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayMode {
+    None,
+    Grid,
+    RuleOfThirds,
+    GoldenRatio,
+    Diagonal,
+}
+
+impl OverlayMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Grid => "Grid",
+            Self::RuleOfThirds => "Rule of Thirds",
+            Self::GoldenRatio => "Golden Ratio",
+            Self::Diagonal => "Diagonal",
+        }
+    }
+
+    /// Discriminant used by the WGSL shader (must match the `switch` cases).
+    fn shader_id(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Grid => 1,
+            Self::RuleOfThirds => 2,
+            Self::GoldenRatio => 3,
+            Self::Diagonal => 4,
+        }
+    }
+}
 
 pub struct TessellatorApp {
     folder_path: Option<PathBuf>,
@@ -58,14 +90,15 @@ pub struct TessellatorApp {
     target_format: wgpu::TextureFormat,
 
     grayscale: f32,
-    grid_opacity: f32,
+    overlay_opacity: f32,
     grid_size: f32,
+    overlay_mode: OverlayMode,
     view: ViewState,
 
     recursion_depth: usize,
 
     /// Image waiting to be uploaded by the next paint callback.
-    pending_high_res: Option<Arc<image::DynamicImage>>,
+    pending_high_res: Option<Arc<DecodedImage>>,
     current_image_size: Option<[u32; 2]>,
 }
 
@@ -92,8 +125,9 @@ impl TessellatorApp {
             pending_scroll_to_index: None,
             target_format,
             grayscale: 0.0,
-            grid_opacity: 0.0,
+            overlay_opacity: 0.5,
             grid_size: 10.0,
+            overlay_mode: OverlayMode::None,
             view: ViewState::identity(),
             recursion_depth: DEFAULT_RECURSION_DEPTH,
             pending_high_res: None,
@@ -113,8 +147,8 @@ impl TessellatorApp {
     }
 
     /// Display the given image in the viewport (and reset to fit-to-screen).
-    fn show_image(&mut self, image: Arc<image::DynamicImage>) {
-        self.current_image_size = Some([image.width(), image.height()]);
+    fn show_image(&mut self, image: Arc<DecodedImage>) {
+        self.current_image_size = Some([image.width, image.height]);
         self.pending_high_res = Some(image);
         self.view = ViewState::FitOnNextFrame;
     }
@@ -206,7 +240,7 @@ impl TessellatorApp {
                                 );
                                 continue;
                             }
-                            log::debug!("High-res ready: {}x{}", image.width(), image.height());
+                            log::debug!("High-res ready: {}x{}", image.width, image.height);
                             self.show_image(image);
                         }
                         ImagePurpose::Preload => {
@@ -215,7 +249,7 @@ impl TessellatorApp {
                             if let Some(i) = self.selected_index
                                 && self.files.get(i).map(|f| &f.path) == Some(&path)
                                 && self.current_image_size.is_none_or(|sz| {
-                                    sz != [image.width(), image.height()]
+                                    sz != [image.width, image.height]
                                 })
                             {
                                 self.show_image(image);
@@ -428,10 +462,28 @@ impl TessellatorApp {
                 ui.label("Grayscale:");
                 ui.add(egui::Slider::new(&mut self.grayscale, 0.0..=1.0));
                 ui.separator();
-                ui.label("Grid Opacity:");
-                ui.add(egui::Slider::new(&mut self.grid_opacity, 0.0..=1.0));
-                ui.label("Grid Size:");
-                ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0));
+                ui.label("Overlay:");
+                egui::ComboBox::from_id_salt("overlay_mode")
+                    .selected_text(self.overlay_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            OverlayMode::None,
+                            OverlayMode::Grid,
+                            OverlayMode::RuleOfThirds,
+                            OverlayMode::GoldenRatio,
+                            OverlayMode::Diagonal,
+                        ] {
+                            ui.selectable_value(&mut self.overlay_mode, mode, mode.label());
+                        }
+                    });
+                if self.overlay_mode != OverlayMode::None {
+                    ui.label("Opacity:");
+                    ui.add(egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0));
+                    if self.overlay_mode == OverlayMode::Grid {
+                        ui.label("Size:");
+                        ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0));
+                    }
+                }
                 ui.separator();
                 if ui.button("Fit").on_hover_text("Fit image to viewport (F)").clicked() {
                     self.view = ViewState::FitOnNextFrame;
@@ -559,9 +611,9 @@ impl TessellatorApp {
             let settings = ShaderSettings {
                 view_matrix: view_matrix(scale, pan),
                 grayscale: self.grayscale,
-                grid_opacity: self.grid_opacity,
+                overlay_opacity: self.overlay_opacity,
                 grid_size: self.grid_size,
-                padding: 0.0,
+                overlay_mode: self.overlay_mode.shader_id(),
             };
 
             let callback = egui_wgpu::Callback::new_paint_callback(
