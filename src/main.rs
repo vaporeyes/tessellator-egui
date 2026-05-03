@@ -6,6 +6,7 @@ mod cache;
 mod gpu;
 mod io;
 mod view;
+mod watcher;
 
 use app::TessellatorApp;
 use eframe::egui;

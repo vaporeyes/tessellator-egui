@@ -116,6 +116,9 @@ pub enum Message {
         error: String,
         purpose: ImagePurpose,
     },
+    /// A change was detected in the watched folder. Debounced and re-scanned
+    /// by the app, not directly handled here.
+    FolderChanged,
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff"];

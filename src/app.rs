@@ -3,9 +3,11 @@
 
 use eframe::egui;
 use eframe::wgpu;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -13,6 +15,7 @@ use crate::cache::ImageCache;
 use crate::gpu::{ShaderSettings, TessellatorCallback};
 use crate::io::{self, DecodedImage, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
+use crate::watcher::FolderWatcher;
 
 /// Maximum bytes of decoded image data held in the LRU cache (~512 MB).
 const CACHE_CAP_BYTES: usize = 512 * 1024 * 1024;
@@ -27,7 +30,10 @@ pub struct FileEntry {
 /// Default folder-scan recursion depth. 1 = the folder itself only.
 const DEFAULT_RECURSION_DEPTH: usize = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Window of inactivity after a watcher event before triggering a re-scan.
+const FOLDER_REFRESH_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OverlayMode {
     None,
     Grid,
@@ -97,9 +103,40 @@ pub struct TessellatorApp {
 
     recursion_depth: usize,
 
-    /// Image waiting to be uploaded by the next paint callback.
-    pending_high_res: Option<Arc<DecodedImage>>,
+    /// Currently displayed image (kept for eyedropper sampling). `None` means
+    /// no image is shown.
+    current_image: Option<Arc<DecodedImage>>,
+    /// `current_image` has changed; the next paint callback should re-upload.
+    needs_upload: bool,
     current_image_size: Option<[u32; 2]>,
+
+    /// Pixel under the cursor in the viewport (image coords + RGBA), updated
+    /// each frame. Drives the eyedropper readout in the status bar.
+    cursor_pixel: Option<CursorSample>,
+
+    /// Folder filesystem watcher; replaced when the folder changes.
+    folder_watcher: Option<FolderWatcher>,
+    /// Deadline for the next debounced folder rescan.
+    folder_refresh_at: Option<Instant>,
+    /// On the next FilesFound, restore selection to this path if present.
+    restore_selection: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct CursorSample {
+    x: u32,
+    y: u32,
+    rgba: [u8; 4],
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PersistentState {
+    folder_path: Option<PathBuf>,
+    recursion_depth: Option<usize>,
+    overlay_mode: Option<OverlayMode>,
+    overlay_opacity: Option<f32>,
+    grid_size: Option<f32>,
+    grayscale: Option<f32>,
 }
 
 impl TessellatorApp {
@@ -111,7 +148,12 @@ impl TessellatorApp {
         let target_format = render_state.target_format;
         let (sender, receiver) = crossbeam_channel::unbounded();
 
-        Self {
+        let saved: PersistentState = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
+            .unwrap_or_default();
+
+        let mut app = Self {
             folder_path: None,
             files: Vec::new(),
             selected_index: None,
@@ -124,15 +166,28 @@ impl TessellatorApp {
             last_load_error: None,
             pending_scroll_to_index: None,
             target_format,
-            grayscale: 0.0,
-            overlay_opacity: 0.5,
-            grid_size: 10.0,
-            overlay_mode: OverlayMode::None,
+            grayscale: saved.grayscale.unwrap_or(0.0),
+            overlay_opacity: saved.overlay_opacity.unwrap_or(0.5),
+            grid_size: saved.grid_size.unwrap_or(10.0),
+            overlay_mode: saved.overlay_mode.unwrap_or(OverlayMode::None),
             view: ViewState::identity(),
-            recursion_depth: DEFAULT_RECURSION_DEPTH,
-            pending_high_res: None,
+            recursion_depth: saved.recursion_depth.unwrap_or(DEFAULT_RECURSION_DEPTH),
+            current_image: None,
+            needs_upload: false,
             current_image_size: None,
+            cursor_pixel: None,
+            folder_watcher: None,
+            folder_refresh_at: None,
+            restore_selection: None,
+        };
+
+        if let Some(path) = saved.folder_path
+            && path.is_dir()
+        {
+            app.open_folder(path, &cc.egui_ctx);
         }
+
+        app
     }
 
     fn open_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -142,14 +197,35 @@ impl TessellatorApp {
         self.requested_thumbnails.clear();
         self.pending_image_requests.clear();
         self.current_image_size = None;
-        self.pending_high_res = None;
-        io::scan_folder(path, self.recursion_depth, self.sender.clone(), ctx.clone());
+        self.current_image = None;
+        self.needs_upload = false;
+        self.cursor_pixel = None;
+        io::scan_folder(
+            path.clone(),
+            self.recursion_depth,
+            self.sender.clone(),
+            ctx.clone(),
+        );
+
+        // (Re)attach the watcher. Drop the old one first so we don't leak a
+        // background thread on each folder change.
+        self.folder_watcher = None;
+        match FolderWatcher::new(
+            &path,
+            self.recursion_depth > 1,
+            self.sender.clone(),
+            ctx.clone(),
+        ) {
+            Ok(w) => self.folder_watcher = Some(w),
+            Err(e) => log::warn!("Failed to start folder watcher for {:?}: {}", path, e),
+        }
     }
 
     /// Display the given image in the viewport (and reset to fit-to-screen).
     fn show_image(&mut self, image: Arc<DecodedImage>) {
         self.current_image_size = Some([image.width, image.height]);
-        self.pending_high_res = Some(image);
+        self.current_image = Some(image);
+        self.needs_upload = true;
         self.view = ViewState::FitOnNextFrame;
     }
 
@@ -213,6 +289,12 @@ impl TessellatorApp {
                             thumbnail: None,
                         })
                         .collect();
+                    if let Some(target) = self.restore_selection.take()
+                        && let Some(i) = self.files.iter().position(|f| f.path == target)
+                    {
+                        self.selected_index = Some(i);
+                        self.pending_scroll_to_index = Some(i);
+                    }
                 }
                 Message::ThumbnailLoaded { path, image } => {
                     if let Some(entry) = self.files.iter_mut().find(|f| f.path == path) {
@@ -270,8 +352,29 @@ impl TessellatorApp {
                         ));
                     }
                 }
+                Message::FolderChanged => {
+                    let deadline = Instant::now() + FOLDER_REFRESH_DEBOUNCE;
+                    self.folder_refresh_at = Some(deadline);
+                    ctx.request_repaint_after(FOLDER_REFRESH_DEBOUNCE + Duration::from_millis(50));
+                }
             }
         }
+    }
+
+    /// Trigger a folder rescan once watcher events have quieted.
+    fn process_folder_refresh(&mut self, ctx: &egui::Context) {
+        let Some(deadline) = self.folder_refresh_at else { return };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.folder_refresh_at = None;
+        let Some(folder) = self.folder_path.clone() else { return };
+        self.restore_selection = self
+            .selected_index
+            .and_then(|i| self.files.get(i))
+            .map(|f| f.path.clone());
+        log::info!("Watcher triggered re-scan of {:?}", folder);
+        self.open_folder(folder, ctx);
     }
 
     /// Read keyboard navigation and view-mode keys and act on them. Uses
@@ -357,6 +460,7 @@ impl TessellatorApp {
 impl eframe::App for TessellatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages(ctx);
+        self.process_folder_refresh(ctx);
         self.handle_dropped_files(ctx);
         self.handle_keyboard_nav(ctx);
         self.show_sidebar(ctx);
@@ -364,6 +468,18 @@ impl eframe::App for TessellatorApp {
         self.show_status_bar(ctx);
         self.show_viewport(ctx);
         self.show_drop_overlay(ctx);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let state = PersistentState {
+            folder_path: self.folder_path.clone(),
+            recursion_depth: Some(self.recursion_depth),
+            overlay_mode: Some(self.overlay_mode),
+            overlay_opacity: Some(self.overlay_opacity),
+            grid_size: Some(self.grid_size),
+            grayscale: Some(self.grayscale),
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &state);
     }
 }
 
@@ -519,6 +635,21 @@ impl TessellatorApp {
                     }
                 }
                 ui.label(format!("Zoom: {}", format_zoom(self.view)));
+                if let Some(s) = self.cursor_pixel {
+                    ui.separator();
+                    let [r, g, b, _a] = s.rgba;
+                    let swatch_size = egui::vec2(14.0, 14.0);
+                    let (rect, _) = ui.allocate_exact_size(swatch_size, egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        egui::Color32::from_rgb(r, g, b),
+                    );
+                    ui.label(format!(
+                        "({}, {})  rgb({}, {}, {})  #{:02X}{:02X}{:02X}",
+                        s.x, s.y, r, g, b, r, g, b
+                    ));
+                }
                 if let Some(folder) = &self.folder_path {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(folder.to_string_lossy());
@@ -608,6 +739,22 @@ impl TessellatorApp {
             self.view = ViewState::Manual { zoom, pan };
 
             let scale = egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y);
+
+            // Eyedropper: sample the pixel under the cursor.
+            self.cursor_pixel = if response.hovered() {
+                ui.input(|i| i.pointer.hover_pos()).and_then(|mouse| {
+                    sample_pixel_at(
+                        mouse,
+                        rect,
+                        scale,
+                        pan,
+                        self.current_image.as_deref()?,
+                    )
+                })
+            } else {
+                None
+            };
+
             let settings = ShaderSettings {
                 view_matrix: view_matrix(scale, pan),
                 grayscale: self.grayscale,
@@ -616,10 +763,17 @@ impl TessellatorApp {
                 overlay_mode: self.overlay_mode.shader_id(),
             };
 
+            let upload = if self.needs_upload {
+                self.needs_upload = false;
+                self.current_image.clone()
+            } else {
+                None
+            };
+
             let callback = egui_wgpu::Callback::new_paint_callback(
                 rect,
                 TessellatorCallback {
-                    image: self.pending_high_res.take(),
+                    image: upload,
                     settings,
                     format: self.target_format,
                 },
@@ -650,4 +804,40 @@ fn format_zoom(view: ViewState) -> String {
         ViewState::FillOnNextFrame => "Fill".to_string(),
         ViewState::Manual { zoom, .. } => format!("{:.0}%", zoom * 100.0),
     }
+}
+
+/// Inverse-transform a screen-space cursor position into image pixel coords
+/// using the same scale/pan that drives the shader's view matrix, then sample
+/// mip 0. Returns `None` if the cursor is outside the image bounds.
+fn sample_pixel_at(
+    mouse: egui::Pos2,
+    rect: egui::Rect,
+    scale: egui::Vec2,
+    pan: egui::Vec2,
+    image: &DecodedImage,
+) -> Option<CursorSample> {
+    let center = rect.center();
+    // Mouse → NDC' (screen-space NDC; egui Y is down so negate to get NDC up).
+    let ndc_x = (mouse.x - center.x) / (rect.width() * 0.5);
+    let ndc_y = -(mouse.y - center.y) / (rect.height() * 0.5);
+    // Inverse of view_matrix: matrix applies (scale * v) + (pan.x, -pan.y).
+    let vx = (ndc_x - pan.x) / scale.x;
+    let vy = (ndc_y + pan.y) / scale.y;
+    // Quad vertex NDC [-1, 1] → tex coords [0, 1] (Y flipped).
+    let u = (vx + 1.0) * 0.5;
+    let v = (1.0 - vy) * 0.5;
+    if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+        return None;
+    }
+    let mip0 = image.mips.first()?;
+    let x = ((u * image.width as f32) as u32).min(image.width.saturating_sub(1));
+    let y = ((v * image.height as f32) as u32).min(image.height.saturating_sub(1));
+    let idx = (y as usize * image.width as usize + x as usize) * 4;
+    let rgba = [
+        *mip0.rgba.get(idx)?,
+        *mip0.rgba.get(idx + 1)?,
+        *mip0.rgba.get(idx + 2)?,
+        *mip0.rgba.get(idx + 3)?,
+    ];
+    Some(CursorSample { x, y, rgba })
 }
