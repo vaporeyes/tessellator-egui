@@ -8,11 +8,18 @@ pub enum ViewState {
     /// Resolve to a fit-to-screen Manual transform on the next frame, once the
     /// viewport size is known.
     FitOnNextFrame,
+    /// Resolve to a fill-the-screen Manual transform (image fully covers
+    /// viewport, may crop) on the next frame.
+    FillOnNextFrame,
     Manual { zoom: f32, pan: egui::Vec2 },
 }
 
 impl ViewState {
     pub fn identity() -> Self {
+        Self::Manual { zoom: 1.0, pan: egui::Vec2::ZERO }
+    }
+
+    pub fn one_to_one() -> Self {
         Self::Manual { zoom: 1.0, pan: egui::Vec2::ZERO }
     }
 }

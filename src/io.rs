@@ -16,7 +16,7 @@ pub enum ImagePurpose {
 }
 
 pub enum Message {
-    FilesFound(Vec<PathBuf>),
+    FilesFound(Vec<ScannedFile>),
     ThumbnailLoaded { path: PathBuf, image: egui::ColorImage },
     ThumbnailFailed,
     ImageDecoded {
@@ -40,21 +40,40 @@ pub fn is_image_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn scan_folder(path: PathBuf, sender: Sender<Message>, ctx: egui::Context) {
+pub struct ScannedFile {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+}
+
+pub fn scan_folder(
+    path: PathBuf,
+    max_depth: usize,
+    sender: Sender<Message>,
+    ctx: egui::Context,
+) {
     // I/O bound, run on a one-off thread to avoid tying up Rayon's CPU pool.
     std::thread::spawn(move || {
         let mut found = Vec::new();
         for entry in walkdir::WalkDir::new(&path)
-            .max_depth(2)
+            .max_depth(max_depth)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
             if is_image_file(entry.path()) {
-                found.push(entry.path().to_path_buf());
+                let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                found.push(ScannedFile {
+                    path: entry.path().to_path_buf(),
+                    size_bytes,
+                });
             }
         }
-        log::info!("Folder scan complete: {} images under {:?}", found.len(), path);
+        log::info!(
+            "Folder scan complete: {} images under {:?} (depth {})",
+            found.len(),
+            path,
+            max_depth
+        );
         let _ = sender.send(Message::FilesFound(found));
         ctx.request_repaint();
     });

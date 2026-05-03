@@ -20,8 +20,12 @@ const CACHE_CAP_BYTES: usize = 512 * 1024 * 1024;
 pub struct FileEntry {
     pub path: PathBuf,
     pub name: String,
+    pub size_bytes: u64,
     pub thumbnail: Option<egui::TextureHandle>,
 }
+
+/// Default folder-scan recursion depth. 1 = the folder itself only.
+const DEFAULT_RECURSION_DEPTH: usize = 2;
 
 pub struct TessellatorApp {
     folder_path: Option<PathBuf>,
@@ -58,6 +62,8 @@ pub struct TessellatorApp {
     grid_size: f32,
     view: ViewState,
 
+    recursion_depth: usize,
+
     /// Image waiting to be uploaded by the next paint callback.
     pending_high_res: Option<Arc<image::DynamicImage>>,
     current_image_size: Option<[u32; 2]>,
@@ -89,9 +95,21 @@ impl TessellatorApp {
             grid_opacity: 0.0,
             grid_size: 10.0,
             view: ViewState::identity(),
+            recursion_depth: DEFAULT_RECURSION_DEPTH,
             pending_high_res: None,
             current_image_size: None,
         }
+    }
+
+    fn open_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.folder_path = Some(path.clone());
+        self.files.clear();
+        self.selected_index = None;
+        self.requested_thumbnails.clear();
+        self.pending_image_requests.clear();
+        self.current_image_size = None;
+        self.pending_high_res = None;
+        io::scan_folder(path, self.recursion_depth, self.sender.clone(), ctx.clone());
     }
 
     /// Display the given image in the viewport (and reset to fit-to-screen).
@@ -146,12 +164,18 @@ impl TessellatorApp {
     fn drain_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
-                Message::FilesFound(paths) => {
-                    self.files = paths
+                Message::FilesFound(scanned) => {
+                    self.files = scanned
                         .into_iter()
-                        .map(|p| FileEntry {
-                            name: p.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                            path: p,
+                        .map(|s| FileEntry {
+                            name: s
+                                .path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string(),
+                            path: s.path,
+                            size_bytes: s.size_bytes,
                             thumbnail: None,
                         })
                         .collect();
@@ -216,26 +240,38 @@ impl TessellatorApp {
         }
     }
 
-    /// Read keyboard navigation keys and act on them. Uses `consume_key` so a
-    /// focused slider doesn't also see the press.
+    /// Read keyboard navigation and view-mode keys and act on them. Uses
+    /// `consume_key` so a focused widget doesn't also see the press.
     fn handle_keyboard_nav(&mut self, ctx: &egui::Context) {
+        let (left, right, home, end, page_up, page_down, space, fit, fill, one_to_one) =
+            ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::End),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::F),
+                    i.consume_key(egui::Modifiers::SHIFT, egui::Key::F),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Num1),
+                )
+            });
+
+        if fit {
+            self.view = ViewState::FitOnNextFrame;
+        } else if fill {
+            self.view = ViewState::FillOnNextFrame;
+        } else if one_to_one {
+            self.view = ViewState::one_to_one();
+        }
+
         if self.files.is_empty() {
             return;
         }
         let last = self.files.len() - 1;
         let current = self.selected_index;
-
-        let (left, right, home, end, page_up, page_down, space) = ctx.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::End),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Space),
-            )
-        });
 
         let target = if home {
             Some(0)
@@ -259,15 +295,41 @@ impl TessellatorApp {
             self.select_image(i, ctx);
         }
     }
+
+    /// Resolve any folders or files dropped onto the window. A dropped folder
+    /// is opened as-is; a dropped file opens its parent directory.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        for file in dropped {
+            let Some(path) = file.path else { continue };
+            let folder = if path.is_dir() {
+                Some(path)
+            } else if path.is_file() {
+                path.parent().map(|p| p.to_path_buf())
+            } else {
+                None
+            };
+            if let Some(folder) = folder {
+                self.open_folder(folder, ctx);
+                break;
+            }
+        }
+    }
 }
 
 impl eframe::App for TessellatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages(ctx);
+        self.handle_dropped_files(ctx);
         self.handle_keyboard_nav(ctx);
         self.show_sidebar(ctx);
         self.show_tools_panel(ctx);
+        self.show_status_bar(ctx);
         self.show_viewport(ctx);
+        self.show_drop_overlay(ctx);
     }
 }
 
@@ -276,6 +338,7 @@ impl TessellatorApp {
         let mut clicked: Option<usize> = None;
         let mut to_request: Vec<PathBuf> = Vec::new();
         let mut open_folder: Option<PathBuf> = None;
+        let mut depth_changed = false;
         let pending_scroll = self.pending_scroll_to_index.take();
 
         egui::SidePanel::left("sidebar")
@@ -283,11 +346,22 @@ impl TessellatorApp {
             .default_width(250.0)
             .show(ctx, |ui| {
                 ui.heading("Tessellator");
-                if ui.button("Open Folder...").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
-                {
-                    open_folder = Some(path);
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Open Folder...").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        open_folder = Some(path);
+                    }
+                    ui.label("Depth:");
+                    let r = ui.add(
+                        egui::DragValue::new(&mut self.recursion_depth)
+                            .range(1..=16)
+                            .speed(0.1),
+                    );
+                    if r.changed() {
+                        depth_changed = true;
+                    }
+                });
                 ui.separator();
 
                 let row_height = 40.0;
@@ -332,12 +406,10 @@ impl TessellatorApp {
             });
 
         if let Some(path) = open_folder {
-            self.folder_path = Some(path.clone());
-            self.files.clear();
-            self.selected_index = None;
-            self.requested_thumbnails.clear();
-            self.pending_image_requests.clear();
-            io::scan_folder(path, self.sender.clone(), ctx.clone());
+            self.open_folder(path, ctx);
+        } else if depth_changed && let Some(path) = self.folder_path.clone() {
+            // Re-scan with the new depth.
+            self.open_folder(path, ctx);
         }
 
         for path in to_request {
@@ -361,11 +433,67 @@ impl TessellatorApp {
                 ui.label("Grid Size:");
                 ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0));
                 ui.separator();
-                if ui.button("Reset View").clicked() {
-                    self.view = ViewState::identity();
+                if ui.button("Fit").on_hover_text("Fit image to viewport (F)").clicked() {
+                    self.view = ViewState::FitOnNextFrame;
+                }
+                if ui.button("Fill").on_hover_text("Fill viewport, may crop (Shift+F)").clicked() {
+                    self.view = ViewState::FillOnNextFrame;
+                }
+                if ui.button("100%").on_hover_text("Display at native pixel size (1)").clicked() {
+                    self.view = ViewState::one_to_one();
                 }
             });
         });
+    }
+
+    fn show_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let entry = self.selected_index.and_then(|i| self.files.get(i));
+                match entry {
+                    Some(entry) => {
+                        ui.label(&entry.name);
+                        ui.separator();
+                        if let Some([w, h]) = self.current_image_size {
+                            ui.label(format!("{} x {}", w, h));
+                            ui.separator();
+                        }
+                        ui.label(format_bytes(entry.size_bytes));
+                        ui.separator();
+                    }
+                    None => {
+                        ui.label(format!("{} images", self.files.len()));
+                        ui.separator();
+                    }
+                }
+                ui.label(format!("Zoom: {}", format_zoom(self.view)));
+                if let Some(folder) = &self.folder_path {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(folder.to_string_lossy());
+                    });
+                }
+            });
+        });
+    }
+
+    fn show_drop_overlay(&mut self, ctx: &egui::Context) {
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if !hovering {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_overlay"),
+        ));
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+        painter.text(
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drop folder to open",
+            egui::FontId::proportional(32.0),
+            egui::Color32::WHITE,
+        );
     }
 
     fn show_viewport(&mut self, ctx: &egui::Context) {
@@ -390,9 +518,16 @@ impl TessellatorApp {
             let response = ui.interact(rect, ui.id(), egui::Sense::drag());
             let screen = rect.size();
 
-            if matches!(self.view, ViewState::FitOnNextFrame) {
-                let zoom = (screen.x / img_w).min(screen.y / img_h);
-                self.view = ViewState::Manual { zoom, pan: egui::Vec2::ZERO };
+            match self.view {
+                ViewState::FitOnNextFrame => {
+                    let zoom = (screen.x / img_w).min(screen.y / img_h);
+                    self.view = ViewState::Manual { zoom, pan: egui::Vec2::ZERO };
+                }
+                ViewState::FillOnNextFrame => {
+                    let zoom = (screen.x / img_w).max(screen.y / img_h);
+                    self.view = ViewState::Manual { zoom, pan: egui::Vec2::ZERO };
+                }
+                ViewState::Manual { .. } => {}
             }
 
             let ViewState::Manual { mut zoom, mut pan } = self.view else {
@@ -439,5 +574,28 @@ impl TessellatorApp {
             );
             ui.painter().with_clip_rect(rect).add(callback);
         });
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", n, UNITS[0])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
+fn format_zoom(view: ViewState) -> String {
+    match view {
+        ViewState::FitOnNextFrame => "Fit".to_string(),
+        ViewState::FillOnNextFrame => "Fill".to_string(),
+        ViewState::Manual { zoom, .. } => format!("{:.0}%", zoom * 100.0),
     }
 }
