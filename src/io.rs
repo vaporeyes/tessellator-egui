@@ -4,8 +4,100 @@
 use crossbeam_channel::Sender;
 use eframe::egui;
 use image::{DynamicImage, ImageDecoder};
+use memmap2::Mmap;
+use std::fs::File;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Files smaller than this don't benefit from mmap (page-table overhead and
+/// minimum mapping size dominate). Read into a Vec instead.
+const MMAP_MIN_BYTES: u64 = 256 * 1024;
+
+/// File contents held either in a heap buffer or as a memory map.
+enum FileBytes {
+    Heap(Vec<u8>),
+    Mapped(Mmap),
+}
+
+impl FileBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            FileBytes::Heap(v) => v.as_slice(),
+            FileBytes::Mapped(m) => &m[..],
+        }
+    }
+}
+
+/// Load file bytes, preferring memory-mapped I/O. Falls back to a regular read
+/// for small files, network-mounted paths (where SIGBUS on disconnect is not
+/// catchable in safe Rust), or any mmap error.
+fn read_file_bytes(path: &Path) -> std::io::Result<FileBytes> {
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+
+    if size < MMAP_MIN_BYTES || is_likely_network_path(path) {
+        return read_to_vec(&mut file, size).map(FileBytes::Heap);
+    }
+
+    // SAFETY: Unsafe because the kernel can't guarantee another process
+    // won't truncate the file mid-read (SIGBUS). For an image viewer reading
+    // local files that the user just selected, this risk is acceptable. The
+    // network-share check above handles the most common SIGBUS scenario.
+    match unsafe { Mmap::map(&file) } {
+        Ok(mmap) => Ok(FileBytes::Mapped(mmap)),
+        Err(e) => {
+            log::warn!("mmap failed for {:?}, falling back to buffered read: {}", path, e);
+            read_to_vec(&mut file, size).map(FileBytes::Heap)
+        }
+    }
+}
+
+fn read_to_vec(file: &mut File, size_hint: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(size_hint as usize);
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Best-effort detection of network-mounted paths. False negatives mean we
+/// take the SIGBUS risk; false positives mean a slightly slower buffered read.
+#[cfg(target_os = "macos")]
+fn is_likely_network_path(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(cpath.as_ptr(), &mut buf) } != 0 {
+        return false;
+    }
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            buf.f_fstypename.as_ptr() as *const u8,
+            buf.f_fstypename.len(),
+        )
+    };
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let name = std::str::from_utf8(&raw[..len]).unwrap_or("");
+    matches!(name, "nfs" | "smbfs" | "afpfs" | "webdav" | "ftp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_likely_network_path(_path: &Path) -> bool {
+    false
+}
+
+/// Convert a DynamicImage to an RgbaImage, consuming the buffer when the
+/// source is already RGBA8. For other variants we still pay for the copy
+/// (alpha needs to be added, sample width converted, etc.).
+fn to_rgba8_consuming(img: DynamicImage) -> image::RgbaImage {
+    match img {
+        DynamicImage::ImageRgba8(buf) => buf,
+        other => other.to_rgba8(),
+    }
+}
 
 /// One level of an RGBA mip chain, ready for direct GPU upload.
 pub struct MipLevel {
@@ -33,13 +125,22 @@ impl DecodedImage {
 
 /// Decode an image, honoring EXIF orientation when the format provides it
 /// (notably JPEG). Without this, phone photos display rotated.
+///
+/// File contents are loaded via memory-mapped I/O when possible, avoiding the
+/// page-cache → user-space copy that the standard `BufReader` path triggers.
 fn decode_image(path: &Path) -> image::ImageResult<DynamicImage> {
-    let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let bytes = read_file_bytes(path).map_err(image::ImageError::IoError)?;
+    let cursor = Cursor::new(bytes.as_slice());
+    let reader = image::ImageReader::new(cursor)
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?;
     let mut decoder = reader.into_decoder()?;
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder)?;
+    // `bytes` must outlive the decoder; explicit drop here documents that.
+    drop(bytes);
     img.apply_orientation(orientation);
     Ok(img)
 }
@@ -48,7 +149,7 @@ fn decode_image(path: &Path) -> image::ImageResult<DynamicImage> {
 /// concentrated here so the render thread sees only `write_texture` calls.
 fn decode_image_with_mips(path: &Path) -> image::ImageResult<DecodedImage> {
     let img = decode_image(path)?;
-    let rgba = img.to_rgba8();
+    let rgba = to_rgba8_consuming(img);
     let (width, height) = rgba.dimensions();
     let max_dim = width.max(height).max(1);
     let level_count = max_dim.ilog2() + 1;
@@ -178,7 +279,7 @@ pub fn request_thumbnail(path: PathBuf, sender: Sender<Message>, ctx: egui::Cont
             Ok(img) => {
                 let thumbnail = img.thumbnail(128, 128);
                 let size = [thumbnail.width() as usize, thumbnail.height() as usize];
-                let pixels = thumbnail.to_rgba8();
+                let pixels = to_rgba8_consuming(thumbnail);
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     size,
                     pixels.as_flat_samples().as_slice(),
