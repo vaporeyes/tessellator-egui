@@ -31,10 +31,19 @@ pub enum AnnotationUpload {
     Clear,
 }
 
+/// One per grid tile (slot 1=B, 2=C, 3=D); slot 0 is always the main image.
+pub enum GridUpload {
+    NoChange,
+    Set(Arc<DecodedImage>),
+    Clear,
+}
+
 pub struct TessellatorCallback {
     pub image: Option<Arc<DecodedImage>>,
     pub compare: CompareUpload,
     pub annotation: AnnotationUpload,
+    /// One entry per grid slot 1..3. Slot 0 (`B`), 1 (`C`), 2 (`D`).
+    pub grid: [GridUpload; 3],
     pub settings: ShaderSettings,
     pub format: wgpu::TextureFormat,
 }
@@ -72,6 +81,16 @@ impl egui_wgpu::CallbackTrait for TessellatorCallback {
             }
             AnnotationUpload::Clear => tess.clear_annotation_texture(device),
             AnnotationUpload::NoChange => {}
+        }
+        for (i, slot) in self.grid.iter().enumerate() {
+            // i=0 -> tile B (bind slot 5), i=1 -> C (6), i=2 -> D (7); the
+            // resources API uses tile slots 1..=3.
+            let tile_slot = (i as u32) + 1;
+            match slot {
+                GridUpload::Set(img) => tess.set_grid_tile(device, queue, tile_slot, Some(img)),
+                GridUpload::Clear => tess.set_grid_tile(device, queue, tile_slot, None),
+                GridUpload::NoChange => {}
+            }
         }
         tess.update_settings(queue, self.settings);
 

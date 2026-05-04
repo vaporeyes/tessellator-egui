@@ -13,7 +13,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::annotation::AnnotationLayer;
 use crate::cache::ImageCache;
-use crate::gpu::{AnnotationUpload, CompareUpload, ShaderSettings, TessellatorCallback};
+use crate::gpu::{AnnotationUpload, CompareUpload, GridUpload, ShaderSettings, TessellatorCallback};
 use crate::io::{self, CancelToken, DecodedImage, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
 use crate::watcher::FolderWatcher;
@@ -220,6 +220,19 @@ pub struct TessellatorApp {
     /// Sidebar filter: only show starred entries.
     show_only_starred: bool,
 
+    /// Multi-image grid compare. Tile 0 is the currently-selected image
+    /// (drawn from `current_image`); tiles 1..=3 are user-picked extras.
+    /// When non-empty, the viewport renders a 1xN strip or 2x2 layout
+    /// depending on `grid_paths.len()` (0=off, 1=N/A, 2=1x2, 3=1x3, 4=2x2).
+    grid_paths: Vec<Option<PathBuf>>,
+    grid_images: Vec<Option<Arc<DecodedImage>>>,
+    /// Set when any tile slot's content has changed; drives the per-frame
+    /// upload (one `GridUpload` entry per slot 1..=3).
+    grid_dirty: [bool; 3],
+    /// Bumped each time grid mode is started; in-flight decodes that arrive
+    /// stale (i.e. with a different generation) are dropped.
+    grid_generation: u64,
+
     show_histogram: bool,
     show_color_panel: bool,
     clipping_warning: bool,
@@ -360,6 +373,10 @@ impl TessellatorApp {
             reference_mode: saved.reference_mode.unwrap_or(false),
             compact: saved.compact.unwrap_or(false),
             show_only_starred: saved.show_only_starred.unwrap_or(false),
+            grid_paths: Vec::new(),
+            grid_images: Vec::new(),
+            grid_dirty: [false; 3],
+            grid_generation: 0,
             show_histogram: saved.show_histogram,
             show_color_panel: false,
             clipping_warning: saved.clipping_warning,
@@ -476,6 +493,70 @@ impl TessellatorApp {
                 ctx,
             );
         }
+    }
+
+    /// Begin a multi-image grid compare. `paths` is the full set of tiles
+    /// including the primary; tile 0 is implicit (the currently-selected
+    /// image), tiles 1..=3 come from `paths`. Caller passes 1..=3 paths.
+    /// Mutually exclusive with the slider compare mode.
+    fn start_grid(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        self.clear_compare();
+        // Bump generation first so any in-flight grid decodes from a prior
+        // start_grid get discarded when they arrive.
+        self.grid_generation = self.grid_generation.wrapping_add(1);
+        self.clear_grid_internal();
+        let n = paths.len().min(3);
+        self.grid_paths = paths[..n].iter().cloned().map(Some).collect();
+        self.grid_images = vec![None; n];
+        self.grid_dirty = [false; 3];
+        // Snapshot (slot_index, path) pairs before mutating self in the loop;
+        // dispatch_image_request needs &mut self.
+        let plan: Vec<(usize, PathBuf)> = self
+            .grid_paths
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.clone().map(|p| (i, p)))
+            .collect();
+        for (i, p) in plan {
+            let tile_slot = (i as u32) + 1;
+            if let Some(img) = self.image_cache.get(&p) {
+                self.grid_images[i] = Some(img);
+                self.grid_dirty[i] = true;
+            } else {
+                self.cancel_image_request(&p);
+                self.dispatch_image_request(
+                    p,
+                    ImagePurpose::Grid { slot: tile_slot, generation: self.grid_generation },
+                    ctx,
+                );
+            }
+        }
+    }
+
+    fn clear_grid_internal(&mut self) {
+        // Cancel any pending grid decodes.
+        let pending: Vec<PathBuf> = self
+            .grid_paths
+            .iter()
+            .filter_map(|p| p.clone())
+            .collect();
+        for p in pending {
+            self.cancel_image_request(&p);
+        }
+        // Mark every slot dirty so the GPU clears its texture next frame.
+        for i in 0..3 {
+            self.grid_dirty[i] = true;
+        }
+        self.grid_paths.clear();
+        self.grid_images.clear();
+    }
+
+    fn clear_grid(&mut self) {
+        self.grid_generation = self.grid_generation.wrapping_add(1);
+        self.clear_grid_internal();
     }
 
     fn clear_compare(&mut self) {
@@ -872,6 +953,18 @@ impl TessellatorApp {
                                 self.compare_dirty = true;
                             }
                         }
+                        ImagePurpose::Grid { slot, generation } => {
+                            if generation == self.grid_generation {
+                                let i = (slot.saturating_sub(1)) as usize;
+                                if let Some(slot_path) =
+                                    self.grid_paths.get(i).and_then(|p| p.clone())
+                                    && slot_path == path
+                                {
+                                    self.grid_images[i] = Some(image);
+                                    self.grid_dirty[i] = true;
+                                }
+                            }
+                        }
                     }
                 }
                 Message::ImageFailed { path, error, purpose } => {
@@ -934,6 +1027,7 @@ impl TessellatorApp {
         }
         if p.escape {
             self.clear_compare();
+            self.clear_grid();
         }
         if p.copy_path
             && let Some(entry) = self.selected_index.and_then(|i| self.files.get(i))
@@ -1318,6 +1412,8 @@ impl TessellatorApp {
                 ui.separator();
                 self.show_compare_controls(ui, ctx);
                 ui.separator();
+                self.show_grid_controls(ui, ctx);
+                ui.separator();
                 ui.checkbox(&mut self.dither, "Dither")
                     .on_hover_text("Add 1-bit noise to remove gradient banding");
                 ui.separator();
@@ -1407,6 +1503,35 @@ impl TessellatorApp {
                 }
             });
         self.show_color_panel = open;
+    }
+
+    fn show_grid_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.grid_paths.is_empty() {
+            if ui
+                .button("Grid...")
+                .on_hover_text("Pick 2-4 images to compare side-by-side")
+                .clicked()
+                && let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                    .pick_files()
+            {
+                // The first picked image goes into the primary slot via
+                // current_image; tiles 1..=3 come from the rest. If the user
+                // picked only 1, treat it as A vs current — promote to a
+                // 2-image grid by using the picked file as tile 1.
+                let extras: Vec<PathBuf> = paths.into_iter().take(3).collect();
+                if !extras.is_empty() {
+                    self.start_grid(extras, ctx);
+                }
+            }
+        } else {
+            let n_extras = self.grid_paths.len();
+            let count = (n_extras + 1).min(4);
+            ui.label(format!("Grid: {} tiles", count));
+            if ui.button("X").on_hover_text("Exit grid mode").clicked() {
+                self.clear_grid();
+            }
+        }
     }
 
     fn show_compare_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1568,7 +1693,17 @@ impl TessellatorApp {
 
             self.view = ViewState::Manual { zoom, pan };
 
-            let scale_unflipped = egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y);
+            let grid_active = !self.grid_paths.is_empty();
+            // In grid mode the geometry quad fills the viewport (the shader
+            // partitions UV into per-tile regions and aspect-fits each
+            // image inside its tile). In single-image mode we shape the
+            // quad to the source image's aspect, so the texture isn't
+            // stretched.
+            let scale_unflipped = if grid_active {
+                egui::vec2(zoom, zoom)
+            } else {
+                egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y)
+            };
             // Negative scale.x mirrors the displayed quad horizontally. Pass
             // this scale to screen_to_uv too so cursor → image-UV inverts
             // correctly under flip (loupe + eyedropper stay coherent).
@@ -1581,7 +1716,7 @@ impl TessellatorApp {
             // Annotation painting: while annotation mode is on, the same
             // viewport drag that would otherwise pan instead deposits brush
             // stamps along the path of the cursor in image-pixel space.
-            if self.annotating {
+            if self.annotating && !grid_active {
                 if response.drag_started() {
                     self.last_paint_pos = None;
                 }
@@ -1626,8 +1761,9 @@ impl TessellatorApp {
             }
 
             // Eyedropper: sample the pixel under the cursor at the mip the
-            // GPU is closest to displaying.
-            self.cursor_pixel = if response.hovered() {
+            // GPU is closest to displaying. Disabled in grid mode (UV no
+            // longer maps 1:1 to a single image).
+            self.cursor_pixel = if response.hovered() && !grid_active {
                 mouse_pos.and_then(|mouse| {
                     sample_pixel_at(
                         mouse,
@@ -1643,9 +1779,11 @@ impl TessellatorApp {
             };
 
             // Loupe: active when Alt is held and the cursor is over the image.
+            // Disabled in grid mode for the same reason as the eyedropper.
             let alt_held = ctx.input(|i| i.modifiers.alt);
             let (loupe_active, loupe_center_screen, loupe_center_uv) = if alt_held
                 && response.hovered()
+                && !grid_active
                 && let Some(m) = mouse_pos
                 && let Some(uv) = screen_to_uv(m, rect, scale, pan)
             {
@@ -1673,7 +1811,35 @@ impl TessellatorApp {
                 clipping_warning: u32::from(self.clipping_warning),
                 posterize_active: u32::from(self.value_study),
                 posterize_levels: self.value_levels,
-                annotation_active: u32::from(self.annotation.is_some()),
+                // Annotation overlay sits in image-UV space; in grid mode
+                // that space is shared across all tiles, so the strokes
+                // would smear. Hide them while comparing.
+                annotation_active: u32::from(self.annotation.is_some() && !grid_active),
+                grid_active: if grid_active { 1 } else { 0 },
+                grid_count: if grid_active {
+                    (self.grid_paths.len() + 1).min(4) as u32
+                } else {
+                    0
+                },
+                screen_aspect: screen.x / screen.y.max(1.0),
+                _pad_grid: 0,
+                tile_image_aspects: {
+                    // Tile 0 = current image; 1..=3 = grid extras. Falls back
+                    // to 1.0 (square) for slots without a loaded image; this
+                    // is just a placeholder while the decode is in flight.
+                    let mut a = [1.0f32; 4];
+                    if let Some([w, h]) = self.current_image_size {
+                        a[0] = (w as f32) / (h.max(1) as f32);
+                    }
+                    for (i, slot) in self.grid_images.iter().enumerate() {
+                        if let Some(img) = slot
+                            && i < 3
+                        {
+                            a[i + 1] = (img.width as f32) / (img.height.max(1) as f32);
+                        }
+                    }
+                    a
+                },
                 shadow_tint: [self.shadow_tint[0], self.shadow_tint[1], self.shadow_tint[2], 0.0],
                 highlight_tint: [
                     self.highlight_tint[0],
@@ -1731,12 +1897,27 @@ impl TessellatorApp {
                 AnnotationUpload::NoChange
             };
 
+            // Grid uploads: one entry per slot 1..=3. Mark dirty -> Set/Clear
+            // based on whether we have an image; otherwise NoChange so the
+            // GPU keeps the previously-bound texture (or its main fallback).
+            let grid_uploads: [GridUpload; 3] = std::array::from_fn(|i| {
+                if !self.grid_dirty[i] {
+                    return GridUpload::NoChange;
+                }
+                self.grid_dirty[i] = false;
+                match self.grid_images.get(i).and_then(|s| s.clone()) {
+                    Some(img) => GridUpload::Set(img),
+                    None => GridUpload::Clear,
+                }
+            });
+
             let callback = egui_wgpu::Callback::new_paint_callback(
                 rect,
                 TessellatorCallback {
                     image: upload,
                     compare: compare_upload,
                     annotation: annotation_upload,
+                    grid: grid_uploads,
                     settings,
                     format: self.target_format,
                 },

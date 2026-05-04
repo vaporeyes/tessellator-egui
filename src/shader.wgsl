@@ -31,6 +31,11 @@ struct Settings {
     posterize_active: u32,
     posterize_levels: u32,
     annotation_active: u32,
+    grid_active: u32,
+    grid_count: u32,
+    screen_aspect: f32,
+    _pad_grid: u32,
+    tile_image_aspects: vec4<f32>,
     shadow_tint: vec3<f32>,
     highlight_tint: vec3<f32>,
 };
@@ -40,6 +45,9 @@ struct Settings {
 @group(0) @binding(2) var<uniform> settings: Settings;
 @group(0) @binding(3) var t_compare: texture_2d<f32>;
 @group(0) @binding(4) var t_annotation: texture_2d<f32>;
+@group(0) @binding(5) var t_grid_b: texture_2d<f32>;
+@group(0) @binding(6) var t_grid_c: texture_2d<f32>;
+@group(0) @binding(7) var t_grid_d: texture_2d<f32>;
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
@@ -83,9 +91,67 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Compare: pick texture based on which side of the divider the UV is on.
+    // Grid mode: partition the displayed UV into N tiles, sample each tile's
+    // own texture with a remapped local UV that aspect-fits the tile so the
+    // image isn't stretched. Letterbox area is filled with dark grey.
     var color: vec4<f32>;
-    if (settings.compare_active != 0u && sample_uv.x > settings.compare_divider) {
+    var on_tile_border: bool = false;
+    if (settings.grid_active != 0u) {
+        let count = settings.grid_count;
+        var tile_idx: u32 = 0u;
+        var local_uv = sample_uv;
+        var tile_w_frac = 1.0;
+        var tile_h_frac = 1.0;
+        if (count == 4u) {
+            // 2x2 grid.
+            if (sample_uv.x >= 0.5) { tile_idx = tile_idx + 1u; }
+            if (sample_uv.y >= 0.5) { tile_idx = tile_idx + 2u; }
+            local_uv = vec2<f32>(fract(sample_uv.x * 2.0), fract(sample_uv.y * 2.0));
+            tile_w_frac = 0.5;
+            tile_h_frac = 0.5;
+            // Border highlight: ~1px in UV terms approximated with smoothstep
+            // on distance to the centre split lines.
+            on_tile_border = abs(sample_uv.x - 0.5) < 0.0015
+                          || abs(sample_uv.y - 0.5) < 0.0015;
+        } else {
+            // 1xN horizontal strip (count = 2 or 3).
+            let n = f32(count);
+            tile_idx = u32(floor(sample_uv.x * n));
+            if (tile_idx >= count) { tile_idx = count - 1u; }
+            local_uv = vec2<f32>(fract(sample_uv.x * n), sample_uv.y);
+            tile_w_frac = 1.0 / n;
+            on_tile_border = false;
+            if (count >= 2u) {
+                on_tile_border = abs(sample_uv.x - 1.0 / n) < 0.0015;
+            }
+            if (count >= 3u) {
+                on_tile_border = on_tile_border || abs(sample_uv.x - 2.0 / n) < 0.0015;
+            }
+        }
+        // Each tile's pixel aspect = (screen_aspect * tile_w_frac) / tile_h_frac.
+        let tile_aspect = settings.screen_aspect * tile_w_frac / tile_h_frac;
+        let img_aspect = settings.tile_image_aspects[tile_idx];
+        var img_uv = local_uv;
+        if (img_aspect > tile_aspect) {
+            // Image wider than tile -> letterbox top/bottom.
+            let scale = tile_aspect / img_aspect;
+            img_uv.y = (local_uv.y - 0.5) / scale + 0.5;
+        } else {
+            let scale = img_aspect / tile_aspect;
+            img_uv.x = (local_uv.x - 0.5) / scale + 0.5;
+        }
+        if (img_uv.x < 0.0 || img_uv.x > 1.0 || img_uv.y < 0.0 || img_uv.y > 1.0) {
+            // Letterbox region.
+            color = vec4<f32>(0.08, 0.08, 0.08, 1.0);
+        } else {
+            switch tile_idx {
+                case 0u: { color = textureSample(t_diffuse, s_diffuse, img_uv); }
+                case 1u: { color = textureSample(t_grid_b, s_diffuse, img_uv); }
+                case 2u: { color = textureSample(t_grid_c, s_diffuse, img_uv); }
+                default: { color = textureSample(t_grid_d, s_diffuse, img_uv); }
+            }
+        }
+    } else if (settings.compare_active != 0u && sample_uv.x > settings.compare_divider) {
         color = textureSample(t_compare, s_diffuse, sample_uv);
     } else {
         color = textureSample(t_diffuse, s_diffuse, sample_uv);
@@ -173,6 +239,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (settings.annotation_active != 0u) {
         let ann = textureSample(t_annotation, s_diffuse, sample_uv);
         final_color = mix(final_color, ann.rgb, ann.a);
+    }
+
+    // Grid mode tile borders: subtle white seam between adjacent tiles so the
+    // user can see where one image ends and the next begins.
+    if (settings.grid_active != 0u && on_tile_border) {
+        final_color = mix(final_color, vec3<f32>(1.0), 0.4);
     }
 
     // Clipping warning: any channel at the extremes flagged with hi-vis colors.

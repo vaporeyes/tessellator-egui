@@ -30,14 +30,26 @@ pub struct ShaderSettings {
     pub posterize_active: u32,
     pub posterize_levels: u32,
     pub annotation_active: u32,
+    /// Multi-image grid (A/B/C/D side-by-side compare). 0 = off, else number
+    /// of tiles (2, 3, or 4).
+    pub grid_active: u32,
+    pub grid_count: u32,
+    /// Width / height of the displayed viewport, used so the shader can
+    /// derive each tile's aspect ratio for letterboxing.
+    pub screen_aspect: f32,
+    pub _pad_grid: u32,
+    /// w/h of each tile's source image. Index 0 is the main (current) image,
+    /// 1..3 are the user-picked grid additions. Unused slots are 0.0.
+    pub tile_image_aspects: [f32; 4],
     /// 4th component is WGSL vec3 padding; ignored by the shader.
     pub shadow_tint: [f32; 4],
     pub highlight_tint: [f32; 4],
 }
 
-// Layout matches WGSL Settings: 48B mat3x3 + scalars + two 16B vec3 blocks.
-// A future field reorder that breaks WGSL alignment will fail to compile here.
-const _: () = assert!(std::mem::size_of::<ShaderSettings>() == 160);
+// Layout matches WGSL Settings: 48B mat3x3 + scalars + grid block + two 16B
+// vec3 blocks. A future field reorder that breaks WGSL alignment will fail
+// to compile here.
+const _: () = assert!(std::mem::size_of::<ShaderSettings>() == 192);
 
 pub struct TessellatorResources {
     pipeline: wgpu::RenderPipeline,
@@ -51,6 +63,12 @@ pub struct TessellatorResources {
     /// 1x1 transparent fallback so bind slot 4 always has something valid
     /// when no annotation layer exists.
     annotation_placeholder: wgpu::Texture,
+    /// Grid mode tiles B / C / D (slot 0 = main_texture). Each falls back to
+    /// the main texture when grid mode is off so the bindings always sample
+    /// something valid.
+    grid_b_texture: Option<wgpu::Texture>,
+    grid_c_texture: Option<wgpu::Texture>,
+    grid_d_texture: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
 }
 
@@ -104,6 +122,36 @@ impl TessellatorResources {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -231,6 +279,9 @@ impl TessellatorResources {
             compare_texture: None,
             annotation_texture: None,
             annotation_placeholder,
+            grid_b_texture: None,
+            grid_c_texture: None,
+            grid_d_texture: None,
             bind_group: None,
         }
     }
@@ -320,6 +371,31 @@ impl TessellatorResources {
         }
     }
 
+    /// Set / clear an additional grid-mode tile (slot 1 = B, 2 = C, 3 = D;
+    /// slot 0 is always main_texture). Passing `None` clears the slot.
+    pub fn set_grid_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: u32,
+        image: Option<&DecodedImage>,
+    ) {
+        let label = match slot {
+            1 => "grid_b",
+            2 => "grid_c",
+            3 => "grid_d",
+            _ => return,
+        };
+        let texture = image.map(|img| create_image_texture(device, queue, img, label));
+        match slot {
+            1 => self.grid_b_texture = texture,
+            2 => self.grid_c_texture = texture,
+            3 => self.grid_d_texture = texture,
+            _ => unreachable!(),
+        }
+        self.rebuild_bind_group(device);
+    }
+
     /// Rebuild the bind group from the current main + (optional) compare
     /// textures. The compare slot falls back to the main texture so the
     /// shader's binding always has something to sample, even when compare
@@ -339,6 +415,21 @@ impl TessellatorResources {
             .annotation_texture
             .as_ref()
             .unwrap_or(&self.annotation_placeholder)
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let grid_b_view = self
+            .grid_b_texture
+            .as_ref()
+            .unwrap_or(main)
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let grid_c_view = self
+            .grid_c_texture
+            .as_ref()
+            .unwrap_or(main)
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let grid_d_view = self
+            .grid_d_texture
+            .as_ref()
+            .unwrap_or(main)
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -364,6 +455,18 @@ impl TessellatorResources {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&annotation_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&grid_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&grid_c_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&grid_d_view),
                 },
             ],
         }));

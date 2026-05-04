@@ -528,6 +528,8 @@ pub enum ImagePurpose {
     Display { generation: u64 },
     Preload,
     Compare { generation: u64 },
+    /// Multi-image grid mode tile. `slot` is 1..=3 (slot 0 is the main image).
+    Grid { slot: u32, generation: u64 },
 }
 
 pub enum Message {

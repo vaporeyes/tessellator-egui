@@ -11,6 +11,7 @@ Designed for the "flip rapidly through a folder of references" workflow, with ex
 - **Fit / Fill / 100% / arbitrary zoom.** One-key access via `F`, `Shift+F`, `1`.
 - **Composition overlays.** Rule of thirds, golden ratio, diagonal cross, custom grid - all with adjustable opacity.
 - **A/B compare.** Pick a second image; drag the divider to reveal one over the other at the same zoom and pan.
+- **Grid compare (A/B/C/D).** Pick 2-4 images and view them side-by-side (1xN strip or 2x2 grid), each aspect-fitted in its tile, sharing a single zoom + pan.
 - **Loupe / magnifier.** Hold `Alt` to get a circular magnifier centered on the cursor.
 - **Eyedropper.** Hovering shows the exact RGB / hex of the pixel under the cursor in the status bar.
 - **Drag-and-drop.** Drop a folder (or any image) onto the window to open.
