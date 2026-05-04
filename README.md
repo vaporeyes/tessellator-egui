@@ -20,6 +20,8 @@ Designed for the "flip rapidly through a folder of references" workflow, with ex
 - **Flip horizontal.** One-key mirror to spot composition issues.
 - **Crop preview.** Overlay the framing for square, 4:5, 16:9, or golden-rectangle ratios.
 - **Annotation layer.** Toggle on, then drag to paint over the image (color picker + brush size + eraser). Strokes auto-save to a sidecar PNG (`photo.jpg.tess.png`) next to the original and reload when you revisit the image.
+- **Stars / favourites.** Mark images as favourites (sidecar JSON `photo.jpg.tess.json`); filter the sidebar to "starred only" with one click.
+- **Reference mode.** Always-on-top + borderless window so the viewer floats above your painting app. Pair with Compact mode to hide all panels for a chrome-free reference image.
 - **Histogram overlay.** RGB + luminance, computed once per image, drawn on the viewport.
 - **Color palette extraction.** 8 dominant colors per image via median cut, click a swatch to copy its hex code.
 - **Split-toning preview.** Cinematic teal/orange by default; pick custom shadow + highlight tints.
@@ -73,6 +75,10 @@ RUST_LOG=debug cargo run --release
 | `H` | Flip horizontal (mirror displayed image) |
 | `V` | Toggle value study (posterized grayscale) |
 | `A` | Toggle annotation mode (drag paints) |
+| `S` | Toggle star on the current image |
+| `Shift+S` | Filter sidebar to starred images only |
+| `T` | Always-on-top + borderless (reference mode) |
+| `\` | Compact (hide all panels - just the image) |
 | `Esc` | Clear compare mode |
 
 ### App

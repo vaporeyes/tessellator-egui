@@ -26,6 +26,18 @@ pub struct FileEntry {
     pub name: String,
     pub size_bytes: u64,
     pub thumbnail: Option<egui::TextureHandle>,
+    /// User-marked favourite. Persisted as a sidecar `<image>.tess.json`
+    /// next to the file (presence == starred, for now).
+    pub starred: bool,
+}
+
+/// Sidecar path for star/tag metadata. Designed to coexist with the annotation
+/// sidecar (.tess.png) under a shared `.tess.*` namespace. Future fields
+/// (color labels, tags, comments) extend the JSON without breaking the format.
+fn star_sidecar_path(image_path: &Path) -> PathBuf {
+    let mut s = image_path.as_os_str().to_owned();
+    s.push(".tess.json");
+    PathBuf::from(s)
 }
 
 /// Default folder-scan recursion depth. 1 = the folder itself only.
@@ -200,6 +212,14 @@ pub struct TessellatorApp {
     /// to match `annotation`'s dimensions.
     annotation_needs_full_upload: bool,
 
+    /// Window pinned above other apps + decorations stripped. Toggled with
+    /// `T`. Lets the viewer float over a painting app as a reference.
+    reference_mode: bool,
+    /// Hide sidebar / tools / status panels for a chrome-free image. `\`.
+    compact: bool,
+    /// Sidebar filter: only show starred entries.
+    show_only_starred: bool,
+
     show_histogram: bool,
     show_color_panel: bool,
     clipping_warning: bool,
@@ -269,6 +289,12 @@ struct PersistentState {
     brush_color: Option<[f32; 3]>,
     #[serde(default)]
     brush_radius: Option<f32>,
+    #[serde(default)]
+    reference_mode: Option<bool>,
+    #[serde(default)]
+    compact: Option<bool>,
+    #[serde(default)]
+    show_only_starred: Option<bool>,
 }
 
 const RECENT_FOLDERS_MAX: usize = 8;
@@ -331,6 +357,9 @@ impl TessellatorApp {
             annotation_path: None,
             last_paint_pos: None,
             annotation_needs_full_upload: false,
+            reference_mode: saved.reference_mode.unwrap_or(false),
+            compact: saved.compact.unwrap_or(false),
+            show_only_starred: saved.show_only_starred.unwrap_or(false),
             show_histogram: saved.show_histogram,
             show_color_panel: false,
             clipping_warning: saved.clipping_warning,
@@ -353,7 +382,25 @@ impl TessellatorApp {
             app.open_folder(path, &cc.egui_ctx);
         }
 
+        // Re-apply persisted window mode on startup so a relaunch keeps the
+        // user's "always on top" preference.
+        if app.reference_mode {
+            app.apply_reference_mode(&cc.egui_ctx);
+        }
+
         app
+    }
+
+    /// Push the current `reference_mode` flag through the viewport: pinned
+    /// above other windows + OS chrome removed when on, normal otherwise.
+    fn apply_reference_mode(&self, ctx: &egui::Context) {
+        let level = if self.reference_mode {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.reference_mode));
     }
 
     fn open_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -505,6 +552,49 @@ impl TessellatorApp {
     /// (`unsaved`). The actual encode + write runs on a one-off background
     /// thread; PNG encoding a multi-MP RGBA buffer can take seconds and
     /// would otherwise block the UI on every drag-stop.
+    /// Flip the starred state of the currently-selected file and write the
+    /// matching sidecar to disk on a background thread. Sidecar presence is
+    /// the source of truth; toggling off removes the file.
+    fn toggle_star_for_selected(&mut self) {
+        let Some(i) = self.selected_index else { return };
+        let Some(entry) = self.files.get_mut(i) else { return };
+        entry.starred = !entry.starred;
+        let path = entry.path.clone();
+        let starred = entry.starred;
+        std::thread::spawn(move || {
+            let sidecar = star_sidecar_path(&path);
+            if starred {
+                // Minimal, forward-compatible JSON. Future versions can add
+                // fields (rating, color label, tags) without rewriting old
+                // sidecars: any unknown field is ignored on read.
+                if let Err(e) = std::fs::write(&sidecar, b"{\"starred\":true}") {
+                    log::warn!("Failed to write {:?}: {}", sidecar, e);
+                }
+            } else {
+                match std::fs::remove_file(&sidecar) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("Failed to remove {:?}: {}", sidecar, e),
+                }
+            }
+        });
+    }
+
+    /// Indices into `self.files` that pass the active filter. When the
+    /// filter is off this is just `0..files.len()`.
+    fn visible_indices(&self) -> Vec<usize> {
+        if self.show_only_starred {
+            self.files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.starred)
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            (0..self.files.len()).collect()
+        }
+    }
+
     /// Drop the in-memory annotation layer and delete its sidecar PNG from
     /// disk (if any). Leaves annotation mode toggled as-is so the user can
     /// immediately start a new layer if they want.
@@ -718,6 +808,9 @@ impl TessellatorApp {
                                 .unwrap_or_default()
                                 .to_string_lossy()
                                 .to_string(),
+                            // Sidecar presence is the source of truth for the
+                            // starred flag; cheap stat() call per file.
+                            starred: star_sidecar_path(&s.path).is_file(),
                             path: s.path,
                             size_bytes: s.size_bytes,
                             thumbnail: None,
@@ -880,32 +973,50 @@ impl TessellatorApp {
         if p.toggle_annotate {
             self.annotating = !self.annotating;
         }
+        if p.toggle_reference_mode {
+            self.reference_mode = !self.reference_mode;
+            self.apply_reference_mode(ctx);
+        }
+        if p.toggle_compact {
+            self.compact = !self.compact;
+        }
+        if p.toggle_star {
+            self.toggle_star_for_selected();
+        }
+        if p.toggle_starred_filter {
+            self.show_only_starred = !self.show_only_starred;
+        }
 
-        // Navigation through file list.
-        if self.files.is_empty() {
+        // Navigation steps through the *visible* (post-filter) list so a
+        // "starred only" view doesn't silently skip past hidden entries.
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             return;
         }
-        let last = self.files.len() - 1;
-        let current = self.selected_index;
-        let target = if p.home {
+        let last = visible.len() - 1;
+        let current_pos = self
+            .selected_index
+            .and_then(|i| visible.iter().position(|v| *v == i));
+        let target_pos = if p.home {
             Some(0)
         } else if p.end {
             Some(last)
         } else if p.left {
-            Some(current.map_or(0, |i| i.saturating_sub(1)))
+            Some(current_pos.map_or(0, |i| i.saturating_sub(1)))
         } else if p.right {
-            Some(current.map_or(0, |i| (i + 1).min(last)))
+            Some(current_pos.map_or(0, |i| (i + 1).min(last)))
         } else if p.page_up {
-            Some(current.map_or(0, |i| i.saturating_sub(10)))
+            Some(current_pos.map_or(0, |i| i.saturating_sub(10)))
         } else if p.page_down {
-            Some(current.map_or(0, |i| (i + 10).min(last)))
+            Some(current_pos.map_or(0, |i| (i + 10).min(last)))
         } else {
             None
         };
-        if let Some(i) = target
-            && Some(i) != current
-        {
-            self.select_image(i, ctx);
+        if let Some(pos) = target_pos {
+            let i = visible[pos];
+            if Some(i) != self.selected_index {
+                self.select_image(i, ctx);
+            }
         }
     }
 
@@ -939,9 +1050,14 @@ impl eframe::App for TessellatorApp {
         self.process_folder_refresh(ctx);
         self.handle_dropped_files(ctx);
         self.handle_keyboard_nav(ctx);
-        self.show_sidebar(ctx);
-        self.show_tools_panel(ctx);
-        self.show_status_bar(ctx);
+        // Compact mode strips chrome down to just the viewport, for a clean
+        // floating reference. Reference mode (`T`) controls always-on-top
+        // and OS decorations independently.
+        if !self.compact {
+            self.show_sidebar(ctx);
+            self.show_tools_panel(ctx);
+            self.show_status_bar(ctx);
+        }
         self.show_viewport(ctx);
         self.show_color_window(ctx);
         self.show_drop_overlay(ctx);
@@ -971,6 +1087,9 @@ impl eframe::App for TessellatorApp {
             crop_ratio: Some(self.crop_ratio),
             brush_color: Some(self.brush_color),
             brush_radius: Some(self.brush_radius),
+            reference_mode: Some(self.reference_mode),
+            compact: Some(self.compact),
+            show_only_starred: Some(self.show_only_starred),
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -1025,39 +1144,66 @@ impl TessellatorApp {
                         depth_changed = true;
                     }
                 });
+                ui.horizontal(|ui| {
+                    let starred_count = self.files.iter().filter(|f| f.starred).count();
+                    ui.checkbox(&mut self.show_only_starred, "Starred only")
+                        .on_hover_text("Filter to favourites (Shift+S)");
+                    ui.label(format!("({}/{})", starred_count, self.files.len()));
+                });
                 ui.separator();
 
                 let row_height = 40.0;
                 let viewport_h = ui.available_height();
 
+                // visible: position-in-list -> index into self.files. When
+                // the filter is off this is the identity. Centralising it
+                // makes scrolling, click translation, and thumbnail requests
+                // all agree on what a row is.
+                let mut visible: Vec<usize> = Vec::with_capacity(self.files.len());
+                for (i, f) in self.files.iter().enumerate() {
+                    if !self.show_only_starred || f.starred {
+                        visible.push(i);
+                    }
+                }
+
+                let mut star_toggle: Option<usize> = None;
                 let mut scroll = egui::ScrollArea::vertical();
-                if let Some(i) = pending_scroll {
-                    let target = (i as f32) * row_height
-                        - viewport_h * 0.5
-                        + row_height * 0.5;
+                if let Some(i) = pending_scroll
+                    && let Some(pos) = visible.iter().position(|v| *v == i)
+                {
+                    let target =
+                        (pos as f32) * row_height - viewport_h * 0.5 + row_height * 0.5;
                     scroll = scroll.vertical_scroll_offset(target.max(0.0));
                 }
 
-                scroll.show_rows(ui, row_height, self.files.len(), |ui, row_range| {
-                    for i in row_range.clone() {
+                scroll.show_rows(ui, row_height, visible.len(), |ui, row_range| {
+                    for pos in row_range.clone() {
+                        let i = visible[pos];
                         let entry = &self.files[i];
                         let is_selected = self.selected_index == Some(i);
-                        let response = ui
+                        let label_resp = ui
                             .horizontal(|ui| {
                                 if let Some(texture) = &entry.thumbnail {
                                     ui.image((texture.id(), egui::vec2(32.0, 32.0)));
                                 } else {
                                     ui.allocate_space(egui::vec2(32.0, 32.0));
                                 }
+                                let star_btn = ui
+                                    .small_button(if entry.starred { "★" } else { "☆" })
+                                    .on_hover_text("Toggle star (S)");
+                                if star_btn.clicked() {
+                                    star_toggle = Some(i);
+                                }
                                 ui.selectable_label(is_selected, &entry.name)
                             })
                             .inner;
-                        if response.clicked() {
+                        if label_resp.clicked() {
                             clicked = Some(i);
                         }
                     }
                     // Only request thumbnails for currently-visible rows.
-                    for i in row_range {
+                    for pos in row_range {
+                        let i = visible[pos];
                         let entry = &self.files[i];
                         if entry.thumbnail.is_none()
                             && !self.requested_thumbnails.contains(&entry.path)
@@ -1066,6 +1212,11 @@ impl TessellatorApp {
                         }
                     }
                 });
+
+                if let Some(i) = star_toggle {
+                    self.selected_index = Some(i);
+                    self.toggle_star_for_selected();
+                }
             });
 
         if let Some(path) = open_folder {
@@ -1183,6 +1334,15 @@ impl TessellatorApp {
                 {
                     // toggle_value already flips it; this is just for the click side-effect
                 }
+                ui.separator();
+                let prev_ref = self.reference_mode;
+                ui.toggle_value(&mut self.reference_mode, "On top")
+                    .on_hover_text("Always-on-top + borderless (T)");
+                if self.reference_mode != prev_ref {
+                    self.apply_reference_mode(ctx);
+                }
+                ui.toggle_value(&mut self.compact, "Compact")
+                    .on_hover_text("Hide all panels - just the image (\\)");
             });
         });
     }
@@ -1770,6 +1930,10 @@ struct Pressed {
     toggle_flip_h: bool,
     toggle_value_study: bool,
     toggle_annotate: bool,
+    toggle_reference_mode: bool,
+    toggle_compact: bool,
+    toggle_star: bool,
+    toggle_starred_filter: bool,
     copy_path: bool,
 }
 
@@ -1807,6 +1971,10 @@ fn read_pressed_keys(ctx: &egui::Context) -> Pressed {
             toggle_flip_h: i.consume_key(Modifiers::NONE, Key::H),
             toggle_value_study: i.consume_key(Modifiers::NONE, Key::V),
             toggle_annotate: i.consume_key(Modifiers::NONE, Key::A),
+            toggle_reference_mode: i.consume_key(Modifiers::NONE, Key::T),
+            toggle_compact: i.consume_key(Modifiers::NONE, Key::Backslash),
+            toggle_star: i.consume_key(Modifiers::NONE, Key::S),
+            toggle_starred_filter: i.consume_key(Modifiers::SHIFT, Key::S),
             copy_path: !any_focused && i.consume_key(Modifiers::COMMAND, Key::C),
         }
     })
