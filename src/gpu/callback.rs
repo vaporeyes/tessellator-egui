@@ -14,9 +14,27 @@ pub enum CompareUpload {
     Clear,
 }
 
+/// What to do with the annotation-slot texture this frame.
+pub enum AnnotationUpload {
+    NoChange,
+    /// Recreate a fresh annotation texture of the given size and upload these
+    /// pixels (RGBA8, row-tight).
+    SetFull { width: u32, height: u32, rgba: Arc<Vec<u8>> },
+    /// Patch a sub-region of the existing annotation texture.
+    Patch {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    Clear,
+}
+
 pub struct TessellatorCallback {
     pub image: Option<Arc<DecodedImage>>,
     pub compare: CompareUpload,
+    pub annotation: AnnotationUpload,
     pub settings: ShaderSettings,
     pub format: wgpu::TextureFormat,
 }
@@ -31,7 +49,7 @@ impl egui_wgpu::CallbackTrait for TessellatorCallback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if !resources.contains::<TessellatorResources>() {
-            resources.insert(TessellatorResources::new(device, self.format));
+            resources.insert(TessellatorResources::new(device, queue, self.format));
         }
         let tess = resources
             .get_mut::<TessellatorResources>()
@@ -44,6 +62,16 @@ impl egui_wgpu::CallbackTrait for TessellatorCallback {
             CompareUpload::Set(image) => tess.set_compare_texture(device, queue, Some(image)),
             CompareUpload::Clear => tess.set_compare_texture(device, queue, None),
             CompareUpload::NoChange => {}
+        }
+        match &self.annotation {
+            AnnotationUpload::SetFull { width, height, rgba } => {
+                tess.set_annotation_texture(device, queue, *width, *height, rgba);
+            }
+            AnnotationUpload::Patch { x, y, width, height, rgba } => {
+                tess.patch_annotation_region(queue, *x, *y, *width, *height, rgba);
+            }
+            AnnotationUpload::Clear => tess.clear_annotation_texture(device),
+            AnnotationUpload::NoChange => {}
         }
         tess.update_settings(queue, self.settings);
 

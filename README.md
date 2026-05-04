@@ -16,6 +16,10 @@ Designed for the "flip rapidly through a folder of references" workflow, with ex
 - **Drag-and-drop.** Drop a folder (or any image) onto the window to open.
 - **Live folder watching.** Files added or removed externally appear in the list within ~500 ms.
 - **Grayscale slider.** Useful for value studies.
+- **Value study mode.** Posterize to 2-8 luma bands to check light/dark structure.
+- **Flip horizontal.** One-key mirror to spot composition issues.
+- **Crop preview.** Overlay the framing for square, 4:5, 16:9, or golden-rectangle ratios.
+- **Annotation layer.** Toggle on, then drag to paint over the image (color picker + brush size + eraser). Strokes auto-save to a sidecar PNG (`photo.jpg.tess.png`) next to the original and reload when you revisit the image.
 - **Histogram overlay.** RGB + luminance, computed once per image, drawn on the viewport.
 - **Color palette extraction.** 8 dominant colors per image via median cut, click a swatch to copy its hex code.
 - **Split-toning preview.** Cinematic teal/orange by default; pick custom shadow + highlight tints.
@@ -66,6 +70,9 @@ RUST_LOG=debug cargo run --release
 | Key | Action |
 |---|---|
 | `G` | Toggle grayscale (full color ↔ full B&W) |
+| `H` | Flip horizontal (mirror displayed image) |
+| `V` | Toggle value study (posterized grayscale) |
+| `A` | Toggle annotation mode (drag paints) |
 | `Esc` | Clear compare mode |
 
 ### App

@@ -1,6 +1,7 @@
 // ABOUTME: Entry point for Tessellator - configures eframe and launches the app.
 // ABOUTME: All application logic lives in the app module.
 
+mod annotation;
 mod app;
 mod cache;
 mod gpu;

@@ -4,5 +4,5 @@
 mod callback;
 mod resources;
 
-pub use callback::{CompareUpload, TessellatorCallback};
+pub use callback::{AnnotationUpload, CompareUpload, TessellatorCallback};
 pub use resources::ShaderSettings;

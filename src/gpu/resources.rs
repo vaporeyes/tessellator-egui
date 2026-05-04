@@ -27,9 +27,9 @@ pub struct ShaderSettings {
     pub split_tone_active: u32,
     pub split_tone_amount: f32,
     pub clipping_warning: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
+    pub posterize_active: u32,
+    pub posterize_levels: u32,
+    pub annotation_active: u32,
     /// 4th component is WGSL vec3 padding; ignored by the shader.
     pub shadow_tint: [f32; 4],
     pub highlight_tint: [f32; 4],
@@ -47,11 +47,15 @@ pub struct TessellatorResources {
     settings_buffer: wgpu::Buffer,
     main_texture: Option<wgpu::Texture>,
     compare_texture: Option<wgpu::Texture>,
+    annotation_texture: Option<wgpu::Texture>,
+    /// 1x1 transparent fallback so bind slot 4 always has something valid
+    /// when no annotation layer exists.
+    annotation_placeholder: wgpu::Texture,
     bind_group: Option<wgpu::BindGroup>,
 }
 
 impl TessellatorResources {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         log::debug!("Creating TessellatorResources with format {:?}", format);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -90,6 +94,16 @@ impl TessellatorResources {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -179,6 +193,34 @@ impl TessellatorResources {
             mapped_at_creation: false,
         });
 
+        let annotation_placeholder = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tessellator.annotation_placeholder"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Initialise the placeholder to fully transparent. write_texture is
+        // safe before the first frame because the queue runs at submit time.
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &annotation_placeholder,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8, 0, 0, 0],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+
         Self {
             pipeline,
             bind_group_layout,
@@ -187,6 +229,8 @@ impl TessellatorResources {
             settings_buffer,
             main_texture: None,
             compare_texture: None,
+            annotation_texture: None,
+            annotation_placeholder,
             bind_group: None,
         }
     }
@@ -212,6 +256,70 @@ impl TessellatorResources {
         self.rebuild_bind_group(device);
     }
 
+    /// Create a fresh transparent annotation texture of the given size and
+    /// optionally upload initial pixels (full RGBA8). Replaces any prior
+    /// annotation texture.
+    pub fn set_annotation_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tessellator.annotation_texture"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        upload_mip(queue, &texture, 0, rgba, width, height);
+        self.annotation_texture = Some(texture);
+        self.rebuild_bind_group(device);
+    }
+
+    /// Patch a sub-region of the existing annotation texture. No-op if no
+    /// annotation texture is currently bound (the app is expected to call
+    /// `set_annotation_texture` first when entering annotation mode).
+    pub fn patch_annotation_region(
+        &self,
+        queue: &wgpu::Queue,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
+        let Some(texture) = &self.annotation_texture else {
+            return;
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+    }
+
+    pub fn clear_annotation_texture(&mut self, device: &wgpu::Device) {
+        if self.annotation_texture.take().is_some() {
+            self.rebuild_bind_group(device);
+        }
+    }
+
     /// Rebuild the bind group from the current main + (optional) compare
     /// textures. The compare slot falls back to the main texture so the
     /// shader's binding always has something to sample, even when compare
@@ -226,6 +334,11 @@ impl TessellatorResources {
             .compare_texture
             .as_ref()
             .unwrap_or(main)
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let annotation_view = self
+            .annotation_texture
+            .as_ref()
+            .unwrap_or(&self.annotation_placeholder)
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -247,6 +360,10 @@ impl TessellatorResources {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&compare_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&annotation_view),
                 },
             ],
         }));

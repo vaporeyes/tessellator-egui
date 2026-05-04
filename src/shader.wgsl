@@ -28,9 +28,9 @@ struct Settings {
     split_tone_active: u32,
     split_tone_amount: f32,
     clipping_warning: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    posterize_active: u32,
+    posterize_levels: u32,
+    annotation_active: u32,
     shadow_tint: vec3<f32>,
     highlight_tint: vec3<f32>,
 };
@@ -39,6 +39,7 @@ struct Settings {
 @group(0) @binding(1) var s_diffuse: sampler;
 @group(0) @binding(2) var<uniform> settings: Settings;
 @group(0) @binding(3) var t_compare: texture_2d<f32>;
+@group(0) @binding(4) var t_annotation: texture_2d<f32>;
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
@@ -92,6 +93,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let gray = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
     var final_color = mix(color.rgb, vec3<f32>(gray), settings.grayscale);
+
+    // Value study: posterize luma to N bands. Always grayscale (artist
+    // convention) and overrides the grayscale slider while active.
+    if (settings.posterize_active != 0u && settings.posterize_levels >= 2u) {
+        let levels = f32(settings.posterize_levels);
+        let q = floor(gray * levels) / (levels - 1.0);
+        final_color = vec3<f32>(clamp(q, 0.0, 1.0));
+    }
 
     // Composition overlays (use the original UV so they stay anchored to the
     // image, not the magnified loupe region).
@@ -155,6 +164,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (settings.dither != 0u) {
         let n = tri_noise(in.clip_position.xy) / 255.0;
         final_color = final_color + vec3<f32>(n);
+    }
+
+    // Annotation overlay: sampled at the same image-UV as the photo (so it
+    // tracks zoom, pan, flip, and is magnified inside the loupe), src-over
+    // blended on top of all colour effects so pen strokes stay legible
+    // regardless of grayscale/posterize/split-tone.
+    if (settings.annotation_active != 0u) {
+        let ann = textureSample(t_annotation, s_diffuse, sample_uv);
+        final_color = mix(final_color, ann.rgb, ann.a);
     }
 
     // Clipping warning: any channel at the extremes flagged with hi-vis colors.

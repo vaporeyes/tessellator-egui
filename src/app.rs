@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::annotation::AnnotationLayer;
 use crate::cache::ImageCache;
-use crate::gpu::{CompareUpload, ShaderSettings, TessellatorCallback};
+use crate::gpu::{AnnotationUpload, CompareUpload, ShaderSettings, TessellatorCallback};
 use crate::io::{self, CancelToken, DecodedImage, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
 use crate::watcher::FolderWatcher;
@@ -37,6 +38,38 @@ const OPEN_SHORTCUT_LABEL: &str = "Ctrl+O";
 
 /// Window of inactivity after a watcher event before triggering a re-scan.
 const FOLDER_REFRESH_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CropRatio {
+    None,
+    Square,
+    FourFive,
+    SixteenNine,
+    Golden,
+}
+
+impl CropRatio {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Square => "Square (1:1)",
+            Self::FourFive => "4:5",
+            Self::SixteenNine => "16:9",
+            Self::Golden => "Golden (1.618:1)",
+        }
+    }
+
+    /// Aspect ratio as width / height. `None` means no crop overlay.
+    fn aspect(self) -> Option<f32> {
+        match self {
+            Self::None => None,
+            Self::Square => Some(1.0),
+            Self::FourFive => Some(4.0 / 5.0),
+            Self::SixteenNine => Some(16.0 / 9.0),
+            Self::Golden => Some(1.6180339),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OverlayMode {
@@ -134,6 +167,39 @@ pub struct TessellatorApp {
     loupe_radius: f32,
     dither: bool,
 
+    /// Mirror the displayed image horizontally. Toggled with `H`. Affects
+    /// view, eyedropper, loupe, and crop overlay coherently.
+    flip_h: bool,
+    /// Posterize luma into N bands ("value study mode"). Overrides grayscale
+    /// while active. Toggled with `V`.
+    value_study: bool,
+    /// Number of value bands when `value_study` is on. Slider range 2..=8.
+    value_levels: u32,
+    /// Crop preview overlay aspect ratio. `None` disables.
+    crop_ratio: CropRatio,
+
+    /// Annotation mode active: drag paints instead of pans.
+    annotating: bool,
+    /// Active brush color (RGB; alpha is taken from the image's pen alpha
+    /// which is always 255 for opaque pen).
+    brush_color: [f32; 3],
+    /// Brush radius in image pixels.
+    brush_radius: f32,
+    /// Eraser mode toggle (within annotation mode).
+    erasing: bool,
+    /// Annotation layer for the currently-displayed image. `None` until the
+    /// user paints something or a sidecar is found on selection.
+    annotation: Option<AnnotationLayer>,
+    /// Path of the image whose annotation is currently in `annotation`. Used
+    /// to save the sidecar back to the right file when the user navigates.
+    annotation_path: Option<PathBuf>,
+    /// Last image-pixel position painted, for line-segment interpolation
+    /// between mouse samples on the same drag.
+    last_paint_pos: Option<(f32, f32)>,
+    /// True if the GPU annotation texture needs to be (re)created next frame
+    /// to match `annotation`'s dimensions.
+    annotation_needs_full_upload: bool,
+
     show_histogram: bool,
     show_color_panel: bool,
     clipping_warning: bool,
@@ -191,6 +257,18 @@ struct PersistentState {
     shadow_tint: Option<[f32; 3]>,
     #[serde(default)]
     highlight_tint: Option<[f32; 3]>,
+    #[serde(default)]
+    flip_h: Option<bool>,
+    #[serde(default)]
+    value_study: Option<bool>,
+    #[serde(default)]
+    value_levels: Option<u32>,
+    #[serde(default)]
+    crop_ratio: Option<CropRatio>,
+    #[serde(default)]
+    brush_color: Option<[f32; 3]>,
+    #[serde(default)]
+    brush_radius: Option<f32>,
 }
 
 const RECENT_FOLDERS_MAX: usize = 8;
@@ -241,6 +319,18 @@ impl TessellatorApp {
             loupe_zoom: saved.loupe_zoom.unwrap_or(4.0),
             loupe_radius: saved.loupe_radius.unwrap_or(120.0),
             dither: saved.dither.unwrap_or(true),
+            flip_h: saved.flip_h.unwrap_or(false),
+            value_study: saved.value_study.unwrap_or(false),
+            value_levels: saved.value_levels.unwrap_or(4).clamp(2, 8),
+            crop_ratio: saved.crop_ratio.unwrap_or(CropRatio::None),
+            annotating: false,
+            brush_color: saved.brush_color.unwrap_or([1.0, 0.15, 0.15]),
+            brush_radius: saved.brush_radius.unwrap_or(8.0).clamp(1.0, 200.0),
+            erasing: false,
+            annotation: None,
+            annotation_path: None,
+            last_paint_pos: None,
+            annotation_needs_full_upload: false,
             show_histogram: saved.show_histogram,
             show_color_panel: false,
             clipping_warning: saved.clipping_warning,
@@ -267,6 +357,12 @@ impl TessellatorApp {
     }
 
     fn open_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // Save any pending annotation before swapping folders. Otherwise the
+        // outgoing layer would be dropped on the floor.
+        self.save_current_annotation();
+        self.annotation = None;
+        self.annotation_path = None;
+        self.annotation_needs_full_upload = false;
         self.folder_path = Some(path.clone());
         self.push_recent_folder(path.clone());
         self.files.clear();
@@ -379,11 +475,93 @@ impl TessellatorApp {
     }
 
     /// Display the given image in the viewport (and reset to fit-to-screen).
+    /// Also runs the annotation handoff: saves any outgoing layer and tries
+    /// to load a sidecar for the new image.
     fn show_image(&mut self, image: Arc<DecodedImage>) {
-        self.current_image_size = Some([image.width, image.height]);
+        let (w, h) = (image.width, image.height);
+        self.current_image_size = Some([w, h]);
         self.current_image = Some(image);
         self.needs_upload = true;
         self.view = ViewState::FitOnNextFrame;
+
+        let new_path = self
+            .selected_index
+            .and_then(|i| self.files.get(i))
+            .map(|f| f.path.clone());
+        if new_path != self.annotation_path {
+            self.save_current_annotation();
+            self.annotation = new_path
+                .as_deref()
+                .and_then(|p| AnnotationLayer::load_sidecar(p, w, h));
+            self.annotation_needs_full_upload = self.annotation.is_some();
+            self.annotation_path = new_path;
+            self.last_paint_pos = None;
+            self.erasing = false;
+        }
+    }
+
+    /// Write the current annotation layer to its sidecar PNG if it has any
+    /// strokes (`touched`) and the in-memory state diverges from disk
+    /// (`unsaved`). The actual encode + write runs on a one-off background
+    /// thread; PNG encoding a multi-MP RGBA buffer can take seconds and
+    /// would otherwise block the UI on every drag-stop.
+    /// Drop the in-memory annotation layer and delete its sidecar PNG from
+    /// disk (if any). Leaves annotation mode toggled as-is so the user can
+    /// immediately start a new layer if they want.
+    fn remove_current_annotation(&mut self) {
+        let path = self.annotation_path.clone();
+        self.annotation = None;
+        self.last_paint_pos = None;
+        // The GPU still holds the prior annotation texture; flag a refresh so
+        // the next frame swaps it for the transparent placeholder. Without
+        // this, the strokes would linger on screen until something else
+        // triggered a bind-group rebuild.
+        self.annotation_needs_full_upload = true;
+        if let Some(p) = path {
+            std::thread::spawn(move || {
+                let sidecar = AnnotationLayer::sidecar_path(&p);
+                match std::fs::remove_file(&sidecar) {
+                    Ok(()) => log::debug!("Removed sidecar: {:?}", sidecar),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("Failed to remove sidecar {:?}: {}", sidecar, e),
+                }
+            });
+        }
+    }
+
+    fn save_current_annotation(&mut self) {
+        let Some(layer) = self.annotation.as_mut() else { return };
+        if !layer.touched || !layer.unsaved {
+            return;
+        }
+        let Some(path) = self.annotation_path.clone() else { return };
+        layer.unsaved = false;
+
+        // Empty layer -> delete the sidecar so erasing everything actually
+        // cleans up the folder rather than leaving a blank PNG behind.
+        if layer.is_empty() {
+            std::thread::spawn(move || {
+                let sidecar = AnnotationLayer::sidecar_path(&path);
+                match std::fs::remove_file(&sidecar) {
+                    Ok(()) => log::debug!("Removed empty sidecar: {:?}", sidecar),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("Failed to remove sidecar {:?}: {}", sidecar, e),
+                }
+            });
+            return;
+        }
+
+        // Clone the buffer so the worker can encode without borrowing self.
+        // This is a Vec memcpy of width*height*4 bytes; far cheaper than the
+        // PNG encode that follows it.
+        let buf = layer.rgba.clone();
+        std::thread::spawn(move || {
+            let sidecar = AnnotationLayer::sidecar_path(&path);
+            match buf.save(&sidecar) {
+                Ok(()) => log::debug!("Saved sidecar: {:?}", sidecar),
+                Err(e) => log::warn!("Failed to save sidecar for {:?}: {}", path, e),
+            }
+        });
     }
 
     fn select_image(&mut self, index: usize, ctx: &egui::Context) {
@@ -693,6 +871,15 @@ impl TessellatorApp {
         if p.toggle_grayscale {
             self.grayscale = if self.grayscale > 0.5 { 0.0 } else { 1.0 };
         }
+        if p.toggle_flip_h {
+            self.flip_h = !self.flip_h;
+        }
+        if p.toggle_value_study {
+            self.value_study = !self.value_study;
+        }
+        if p.toggle_annotate {
+            self.annotating = !self.annotating;
+        }
 
         // Navigation through file list.
         if self.files.is_empty() {
@@ -778,6 +965,12 @@ impl eframe::App for TessellatorApp {
             split_tone_amount: Some(self.split_tone_amount),
             shadow_tint: Some(self.shadow_tint),
             highlight_tint: Some(self.highlight_tint),
+            flip_h: Some(self.flip_h),
+            value_study: Some(self.value_study),
+            value_levels: Some(self.value_levels),
+            crop_ratio: Some(self.crop_ratio),
+            brush_color: Some(self.brush_color),
+            brush_radius: Some(self.brush_radius),
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -897,6 +1090,47 @@ impl TessellatorApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Grayscale:");
                 ui.add(egui::Slider::new(&mut self.grayscale, 0.0..=1.0));
+                ui.separator();
+                ui.checkbox(&mut self.value_study, "Values")
+                    .on_hover_text("Posterize to N bands for value study (V)");
+                if self.value_study {
+                    ui.add(egui::Slider::new(&mut self.value_levels, 2..=8).text("bands"));
+                }
+                ui.separator();
+                ui.checkbox(&mut self.flip_h, "Flip H")
+                    .on_hover_text("Mirror horizontally to spot composition issues (H)");
+                ui.separator();
+                ui.label("Crop:");
+                egui::ComboBox::from_id_salt("crop_ratio")
+                    .selected_text(self.crop_ratio.label())
+                    .show_ui(ui, |ui| {
+                        for r in [
+                            CropRatio::None,
+                            CropRatio::Square,
+                            CropRatio::FourFive,
+                            CropRatio::SixteenNine,
+                            CropRatio::Golden,
+                        ] {
+                            ui.selectable_value(&mut self.crop_ratio, r, r.label());
+                        }
+                    });
+                ui.separator();
+                ui.toggle_value(&mut self.annotating, "Annotate")
+                    .on_hover_text(
+                        "Drag to paint over the image; strokes save to a sidecar PNG (A)",
+                    );
+                if self.annotating {
+                    ui.color_edit_button_rgb(&mut self.brush_color);
+                    ui.add(egui::Slider::new(&mut self.brush_radius, 1.0..=200.0).text("px"));
+                    ui.toggle_value(&mut self.erasing, "Erase");
+                    if ui
+                        .button("Clear")
+                        .on_hover_text("Remove all strokes and delete the sidecar PNG")
+                        .clicked()
+                    {
+                        self.remove_current_annotation();
+                    }
+                }
                 ui.separator();
                 ui.label("Overlay:");
                 egui::ComboBox::from_id_salt("overlay_mode")
@@ -1168,14 +1402,68 @@ impl TessellatorApp {
                 }
             }
 
-            if response.dragged() {
+            if response.dragged() && !self.annotating {
                 pan += response.drag_delta() / (screen * 0.5);
             }
 
             self.view = ViewState::Manual { zoom, pan };
 
-            let scale = egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y);
+            let scale_unflipped = egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y);
+            // Negative scale.x mirrors the displayed quad horizontally. Pass
+            // this scale to screen_to_uv too so cursor → image-UV inverts
+            // correctly under flip (loupe + eyedropper stay coherent).
+            let scale = egui::vec2(
+                if self.flip_h { -scale_unflipped.x } else { scale_unflipped.x },
+                scale_unflipped.y,
+            );
             let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+
+            // Annotation painting: while annotation mode is on, the same
+            // viewport drag that would otherwise pan instead deposits brush
+            // stamps along the path of the cursor in image-pixel space.
+            if self.annotating {
+                if response.drag_started() {
+                    self.last_paint_pos = None;
+                }
+                if response.dragged()
+                    && let Some(mp) = response.interact_pointer_pos()
+                    && let Some(uv) = screen_to_uv(mp, rect, scale, pan)
+                {
+                    let img_x = uv.x * img_w;
+                    let img_y = uv.y * img_h;
+                    if self.annotation.is_none() {
+                        self.annotation = Some(AnnotationLayer::new(img_w as u32, img_h as u32));
+                        self.annotation_path = self
+                            .selected_index
+                            .and_then(|i| self.files.get(i))
+                            .map(|f| f.path.clone());
+                        self.annotation_needs_full_upload = true;
+                    }
+                    let layer = self.annotation.as_mut().expect("just initialised");
+                    let color = [
+                        (self.brush_color[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (self.brush_color[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (self.brush_color[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+                        255,
+                    ];
+                    if let Some(prev) = self.last_paint_pos {
+                        layer.stroke(
+                            prev,
+                            (img_x, img_y),
+                            self.brush_radius,
+                            color,
+                            self.erasing,
+                        );
+                    } else {
+                        layer.stamp(img_x, img_y, self.brush_radius, color, self.erasing);
+                    }
+                    self.last_paint_pos = Some((img_x, img_y));
+                }
+                if response.drag_stopped() {
+                    self.last_paint_pos = None;
+                    self.save_current_annotation();
+                }
+            }
 
             // Eyedropper: sample the pixel under the cursor at the mip the
             // GPU is closest to displaying.
@@ -1223,9 +1511,9 @@ impl TessellatorApp {
                 split_tone_active: u32::from(self.split_tone_amount > 0.0),
                 split_tone_amount: self.split_tone_amount,
                 clipping_warning: u32::from(self.clipping_warning),
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
+                posterize_active: u32::from(self.value_study),
+                posterize_levels: self.value_levels,
+                annotation_active: u32::from(self.annotation.is_some()),
                 shadow_tint: [self.shadow_tint[0], self.shadow_tint[1], self.shadow_tint[2], 0.0],
                 highlight_tint: [
                     self.highlight_tint[0],
@@ -1252,16 +1540,63 @@ impl TessellatorApp {
                 CompareUpload::NoChange
             };
 
+            // Annotation upload: a full re-upload is required when entering a
+            // new layer (size mismatch with prior GPU texture). After that,
+            // only the dirty rect from this frame's strokes goes up the wire.
+            let annotation_upload = if self.annotation_needs_full_upload {
+                self.annotation_needs_full_upload = false;
+                match &mut self.annotation {
+                    Some(layer) => {
+                        layer.take_dirty(); // clear so we don't double-upload
+                        AnnotationUpload::SetFull {
+                            width: layer.width,
+                            height: layer.height,
+                            rgba: Arc::new(layer.rgba.as_raw().clone()),
+                        }
+                    }
+                    None => AnnotationUpload::Clear,
+                }
+            } else if let Some(layer) = self.annotation.as_mut() {
+                match layer.take_dirty() {
+                    Some((rect, data)) => AnnotationUpload::Patch {
+                        x: rect.min_x,
+                        y: rect.min_y,
+                        width: rect.max_x - rect.min_x,
+                        height: rect.max_y - rect.min_y,
+                        rgba: data,
+                    },
+                    None => AnnotationUpload::NoChange,
+                }
+            } else {
+                AnnotationUpload::NoChange
+            };
+
             let callback = egui_wgpu::Callback::new_paint_callback(
                 rect,
                 TessellatorCallback {
                     image: upload,
                     compare: compare_upload,
+                    annotation: annotation_upload,
                     settings,
                     format: self.target_format,
                 },
             );
             ui.painter().with_clip_rect(rect).add(callback);
+
+            // Crop preview: paint dimming + outline over the displayed image.
+            if let Some(aspect) = self.crop_ratio.aspect() {
+                let half = egui::vec2(
+                    scale_unflipped.x * rect.width() * 0.5,
+                    scale_unflipped.y * rect.height() * 0.5,
+                );
+                let center = egui::pos2(
+                    rect.center().x + pan.x * rect.width() * 0.5,
+                    rect.center().y + pan.y * rect.height() * 0.5,
+                );
+                let image_rect =
+                    egui::Rect::from_center_size(center, egui::vec2(half.x * 2.0, half.y * 2.0));
+                draw_crop_overlay(ui, rect, image_rect, aspect);
+            }
 
             // Histogram overlay sits on top of the viewport in the corner.
             if self.show_histogram
@@ -1271,6 +1606,70 @@ impl TessellatorApp {
             }
         });
     }
+}
+
+/// Paint a crop-ratio preview: dim the area outside the centered crop rect
+/// (clipped to the displayed image), then stroke a thin outline + thirds.
+fn draw_crop_overlay(
+    ui: &egui::Ui,
+    viewport: egui::Rect,
+    image_rect: egui::Rect,
+    aspect: f32,
+) {
+    // Fit the largest aspect-correct rect inside image_rect.
+    let img_aspect = image_rect.width() / image_rect.height().max(1e-6);
+    let (cw, ch) = if aspect >= img_aspect {
+        (image_rect.width(), image_rect.width() / aspect)
+    } else {
+        (image_rect.height() * aspect, image_rect.height())
+    };
+    let crop = egui::Rect::from_center_size(image_rect.center(), egui::vec2(cw, ch));
+    let painter = ui.painter().with_clip_rect(viewport);
+    let dim = egui::Color32::from_black_alpha(140);
+
+    // Four bands of the image_rect outside the crop. Skip degenerate rects.
+    let bands = [
+        egui::Rect::from_min_max(image_rect.min, egui::pos2(image_rect.max.x, crop.min.y)),
+        egui::Rect::from_min_max(egui::pos2(image_rect.min.x, crop.max.y), image_rect.max),
+        egui::Rect::from_min_max(
+            egui::pos2(image_rect.min.x, crop.min.y),
+            egui::pos2(crop.min.x, crop.max.y),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(crop.max.x, crop.min.y),
+            egui::pos2(image_rect.max.x, crop.max.y),
+        ),
+    ];
+    for b in bands {
+        if b.width() > 0.5 && b.height() > 0.5 {
+            painter.rect_filled(b, 0.0, dim);
+        }
+    }
+
+    let stroke = egui::Stroke::new(1.5, egui::Color32::from_white_alpha(220));
+    painter.rect_stroke(crop, 0.0, stroke, egui::StrokeKind::Inside);
+    // Rule-of-thirds inside the crop for composition reference.
+    let thin = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110));
+    let third_x1 = crop.left() + crop.width() / 3.0;
+    let third_x2 = crop.left() + crop.width() * 2.0 / 3.0;
+    let third_y1 = crop.top() + crop.height() / 3.0;
+    let third_y2 = crop.top() + crop.height() * 2.0 / 3.0;
+    painter.line_segment(
+        [egui::pos2(third_x1, crop.top()), egui::pos2(third_x1, crop.bottom())],
+        thin,
+    );
+    painter.line_segment(
+        [egui::pos2(third_x2, crop.top()), egui::pos2(third_x2, crop.bottom())],
+        thin,
+    );
+    painter.line_segment(
+        [egui::pos2(crop.left(), third_y1), egui::pos2(crop.right(), third_y1)],
+        thin,
+    );
+    painter.line_segment(
+        [egui::pos2(crop.left(), third_y2), egui::pos2(crop.right(), third_y2)],
+        thin,
+    );
 }
 
 /// Draw a 256-bin RGB + luma histogram in the top-right corner of `viewport`.
@@ -1368,6 +1767,9 @@ struct Pressed {
     zoom_out: bool,
     // Tools
     toggle_grayscale: bool,
+    toggle_flip_h: bool,
+    toggle_value_study: bool,
+    toggle_annotate: bool,
     copy_path: bool,
 }
 
@@ -1402,6 +1804,9 @@ fn read_pressed_keys(ctx: &egui::Context) -> Pressed {
             zoom_out: i.consume_key(Modifiers::NONE, Key::Minus),
 
             toggle_grayscale: i.consume_key(Modifiers::NONE, Key::G),
+            toggle_flip_h: i.consume_key(Modifiers::NONE, Key::H),
+            toggle_value_study: i.consume_key(Modifiers::NONE, Key::V),
+            toggle_annotate: i.consume_key(Modifiers::NONE, Key::A),
             copy_path: !any_focused && i.consume_key(Modifiers::COMMAND, Key::C),
         }
     })
