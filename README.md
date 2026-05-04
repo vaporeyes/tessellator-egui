@@ -16,6 +16,10 @@ Designed for the "flip rapidly through a folder of references" workflow, with ex
 - **Drag-and-drop.** Drop a folder (or any image) onto the window to open.
 - **Live folder watching.** Files added or removed externally appear in the list within ~500 ms.
 - **Grayscale slider.** Useful for value studies.
+- **Histogram overlay.** RGB + luminance, computed once per image, drawn on the viewport.
+- **Color palette extraction.** 8 dominant colors per image via median cut, click a swatch to copy its hex code.
+- **Split-toning preview.** Cinematic teal/orange by default; pick custom shadow + highlight tints.
+- **Clipping warning.** Magenta over blown highlights, cyan over crushed shadows.
 - **EXIF orientation.** Phone photos display upright.
 - **Persistence.** Last folder, panel sizes, and tool settings restore on launch.
 

@@ -185,13 +185,15 @@ pub struct MipLevel {
 }
 
 /// A fully prepared image: dimensions plus a complete RGBA mip chain. All
-/// CPU-side work (decode, EXIF rotate, RGBA convert, mip generation) is done
-/// on the worker thread that produces this so the render thread only needs to
-/// memcpy bytes to the GPU.
+/// CPU-side work (decode, EXIF rotate, RGBA convert, mip generation,
+/// histogram, palette extraction) is done on the worker thread that produces
+/// this so the render thread only needs to memcpy bytes to the GPU.
 pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
     pub mips: Vec<MipLevel>,
+    pub histogram: Histogram,
+    pub palette: Vec<[u8; 3]>,
 }
 
 impl DecodedImage {
@@ -199,6 +201,128 @@ impl DecodedImage {
     pub fn byte_size(&self) -> usize {
         self.mips.iter().map(|m| m.rgba.len()).sum()
     }
+}
+
+/// 256-bucket histograms for each channel + luminance, plus the max bin count
+/// across all channels (used to scale the on-screen overlay).
+#[derive(Clone)]
+pub struct Histogram {
+    pub r: [u32; 256],
+    pub g: [u32; 256],
+    pub b: [u32; 256],
+    pub luma: [u32; 256],
+    pub max: u32,
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            r: [0; 256],
+            g: [0; 256],
+            b: [0; 256],
+            luma: [0; 256],
+            max: 0,
+        }
+    }
+}
+
+/// Build per-channel + luma histograms from raw RGBA bytes.
+fn compute_histogram(rgba: &[u8]) -> Histogram {
+    let mut h = Histogram::default();
+    for px in rgba.chunks_exact(4) {
+        h.r[px[0] as usize] += 1;
+        h.g[px[1] as usize] += 1;
+        h.b[px[2] as usize] += 1;
+        // Luma via the same coefficients used by the grayscale shader path.
+        let l = (px[0] as u32 * 299 + px[1] as u32 * 587 + px[2] as u32 * 114) / 1000;
+        h.luma[l.min(255) as usize] += 1;
+    }
+    h.max = h.r.iter().chain(h.g.iter()).chain(h.b.iter()).chain(h.luma.iter())
+        .copied()
+        .max()
+        .unwrap_or(0);
+    h
+}
+
+/// Median-cut palette extraction. Splits the color box repeatedly along the
+/// widest channel until `target_count` boxes exist, then averages each box to
+/// produce a palette color. Pixel-frequency-weighted (no dedupe).
+fn extract_palette(rgba: &[u8], target_count: usize) -> Vec<[u8; 3]> {
+    if rgba.len() < 4 || target_count == 0 {
+        return Vec::new();
+    }
+    let mut pixels: Vec<[u8; 3]> = rgba
+        .chunks_exact(4)
+        .map(|p| [p[0], p[1], p[2]])
+        .collect();
+
+    // Index ranges into `pixels` so we can mutably sort each slice without
+    // juggling overlapping borrows.
+    let mut boxes: Vec<(usize, usize)> = vec![(0, pixels.len())];
+
+    while boxes.len() < target_count {
+        // Find the splittable box with the widest channel range.
+        let pick = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, e))| e - s > 1)
+            .map(|(idx, &(s, e))| {
+                let slice = &pixels[s..e];
+                let (channel, range) = widest_channel(slice);
+                (idx, channel, range)
+            })
+            .max_by_key(|&(_, _, r)| r);
+        let Some((idx, channel, _)) = pick else { break };
+
+        let (s, e) = boxes.swap_remove(idx);
+        let slice = &mut pixels[s..e];
+        slice.sort_by_key(|p| p[channel]);
+        let mid = s + slice.len() / 2;
+        boxes.push((s, mid));
+        boxes.push((mid, e));
+    }
+
+    let mut palette: Vec<[u8; 3]> = boxes
+        .iter()
+        .map(|&(s, e)| average_color(&pixels[s..e]))
+        .collect();
+    // Sort by luma so the displayed swatches feel ordered.
+    palette.sort_by_key(|p| {
+        (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) as i32
+    });
+    palette
+}
+
+/// Returns (channel index 0..3, range) for the channel with the widest spread.
+fn widest_channel(pixels: &[[u8; 3]]) -> (usize, u8) {
+    let mut mn = [u8::MAX; 3];
+    let mut mx = [0u8; 3];
+    for p in pixels {
+        for c in 0..3 {
+            if p[c] < mn[c] { mn[c] = p[c]; }
+            if p[c] > mx[c] { mx[c] = p[c]; }
+        }
+    }
+    let mut best = (0, 0u8);
+    for c in 0..3 {
+        let range = mx[c].saturating_sub(mn[c]);
+        if range > best.1 { best = (c, range); }
+    }
+    best
+}
+
+fn average_color(pixels: &[[u8; 3]]) -> [u8; 3] {
+    if pixels.is_empty() {
+        return [0, 0, 0];
+    }
+    let mut sum = [0u64; 3];
+    for p in pixels {
+        sum[0] += p[0] as u64;
+        sum[1] += p[1] as u64;
+        sum[2] += p[2] as u64;
+    }
+    let n = pixels.len() as u64;
+    [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8]
 }
 
 /// Decode an image, honoring EXIF orientation when the format provides it
@@ -264,7 +388,23 @@ fn decode_image_with_mips(
         let prev = mips.last().unwrap();
         mips.push(downsample_box(&prev.rgba, prev.width, prev.height));
     }
-    Ok(DecodedImage { width, height, mips })
+
+    // Color analysis: histogram from a mip with ~100k+ samples, palette from
+    // a smaller mip (~10k samples is plenty for median cut). Falls back to
+    // the smallest available mip for tiny images.
+    if cancel.is_cancelled() {
+        return Err(DecodeError::Cancelled);
+    }
+    let last_mip = mips.len().saturating_sub(1);
+    let hist_lod = 3.min(last_mip);
+    let pal_lod = 5.min(last_mip);
+    let histogram = compute_histogram(&mips[hist_lod].rgba);
+    if cancel.is_cancelled() {
+        return Err(DecodeError::Cancelled);
+    }
+    let palette = extract_palette(&mips[pal_lod].rgba, 8);
+
+    Ok(DecodedImage { width, height, mips, histogram, palette })
 }
 
 /// 2x2 box-filter downsample of an RGBA8 buffer. Odd dimensions clamp to the

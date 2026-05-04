@@ -134,6 +134,13 @@ pub struct TessellatorApp {
     loupe_radius: f32,
     dither: bool,
 
+    show_histogram: bool,
+    show_color_panel: bool,
+    clipping_warning: bool,
+    split_tone_amount: f32,
+    shadow_tint: [f32; 3],
+    highlight_tint: [f32; 3],
+
     /// Multiplier to apply to the current zoom on the next viewport frame
     /// (set by keyboard zoom-step shortcuts).
     pending_zoom_step: Option<f32>,
@@ -174,6 +181,16 @@ struct PersistentState {
     dither: Option<bool>,
     #[serde(default)]
     recent_folders: Vec<PathBuf>,
+    #[serde(default)]
+    show_histogram: bool,
+    #[serde(default)]
+    clipping_warning: bool,
+    #[serde(default)]
+    split_tone_amount: Option<f32>,
+    #[serde(default)]
+    shadow_tint: Option<[f32; 3]>,
+    #[serde(default)]
+    highlight_tint: Option<[f32; 3]>,
 }
 
 const RECENT_FOLDERS_MAX: usize = 8;
@@ -224,6 +241,14 @@ impl TessellatorApp {
             loupe_zoom: saved.loupe_zoom.unwrap_or(4.0),
             loupe_radius: saved.loupe_radius.unwrap_or(120.0),
             dither: saved.dither.unwrap_or(true),
+            show_histogram: saved.show_histogram,
+            show_color_panel: false,
+            clipping_warning: saved.clipping_warning,
+            split_tone_amount: saved.split_tone_amount.unwrap_or(0.0),
+            // Cinematic teal-and-orange defaults: visible immediately when
+            // the user drags the amount slider above 0.
+            shadow_tint: saved.shadow_tint.unwrap_or([0.20, 0.40, 0.55]),
+            highlight_tint: saved.highlight_tint.unwrap_or([0.95, 0.65, 0.30]),
             pending_zoom_step: None,
             recent_folders: saved.recent_folders,
             cursor_pixel: None,
@@ -731,6 +756,7 @@ impl eframe::App for TessellatorApp {
         self.show_tools_panel(ctx);
         self.show_status_bar(ctx);
         self.show_viewport(ctx);
+        self.show_color_window(ctx);
         self.show_drop_overlay(ctx);
     }
 
@@ -747,6 +773,11 @@ impl eframe::App for TessellatorApp {
             loupe_radius: Some(self.loupe_radius),
             dither: Some(self.dither),
             recent_folders: self.recent_folders.clone(),
+            show_histogram: self.show_histogram,
+            clipping_warning: self.clipping_warning,
+            split_tone_amount: Some(self.split_tone_amount),
+            shadow_tint: Some(self.shadow_tint),
+            highlight_tint: Some(self.highlight_tint),
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
@@ -863,7 +894,7 @@ impl TessellatorApp {
 
     fn show_tools_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("tools").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Grayscale:");
                 ui.add(egui::Slider::new(&mut self.grayscale, 0.0..=1.0));
                 ui.separator();
@@ -904,8 +935,84 @@ impl TessellatorApp {
                 ui.separator();
                 ui.checkbox(&mut self.dither, "Dither")
                     .on_hover_text("Add 1-bit noise to remove gradient banding");
+                ui.separator();
+                ui.checkbox(&mut self.show_histogram, "Histogram")
+                    .on_hover_text("RGB + luminance histogram overlay");
+                ui.checkbox(&mut self.clipping_warning, "Clip")
+                    .on_hover_text(
+                        "Highlight clipped pixels - magenta = blown highlights, cyan = crushed shadows",
+                    );
+                if ui
+                    .toggle_value(&mut self.show_color_panel, "Color...")
+                    .on_hover_text("Open palette + split-tone controls")
+                    .clicked()
+                {
+                    // toggle_value already flips it; this is just for the click side-effect
+                }
             });
         });
+    }
+
+    fn show_color_window(&mut self, ctx: &egui::Context) {
+        if !self.show_color_panel {
+            return;
+        }
+        let mut open = self.show_color_panel;
+        egui::Window::new("Color")
+            .open(&mut open)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.heading("Split-tone");
+                ui.add(
+                    egui::Slider::new(&mut self.split_tone_amount, 0.0..=1.0).text("Amount"),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Shadows:");
+                    ui.color_edit_button_rgb(&mut self.shadow_tint);
+                    ui.label("Highlights:");
+                    ui.color_edit_button_rgb(&mut self.highlight_tint);
+                });
+                if ui.button("Reset to teal/orange").clicked() {
+                    self.shadow_tint = [0.20, 0.40, 0.55];
+                    self.highlight_tint = [0.95, 0.65, 0.30];
+                }
+
+                ui.separator();
+                ui.heading("Palette");
+                if let Some(image) = self.current_image.as_ref() {
+                    if image.palette.is_empty() {
+                        ui.label("(no palette)");
+                    } else {
+                        let palette = image.palette.clone();
+                        let mut to_copy: Option<String> = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for [r, g, b] in &palette {
+                                let hex = format!("#{:02X}{:02X}{:02X}", r, g, b);
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(36.0, 36.0),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    4.0,
+                                    egui::Color32::from_rgb(*r, *g, *b),
+                                );
+                                let resp = resp.on_hover_text(format!("{} (click to copy)", hex));
+                                if resp.clicked() {
+                                    to_copy = Some(hex);
+                                }
+                            }
+                        });
+                        if let Some(hex) = to_copy {
+                            ctx.copy_text(hex.clone());
+                            log::debug!("Copied palette swatch: {}", hex);
+                        }
+                    }
+                } else {
+                    ui.label("(load an image to see its palette)");
+                }
+            });
+        self.show_color_panel = open;
     }
 
     fn show_compare_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1113,8 +1220,19 @@ impl TessellatorApp {
                 loupe_center_screen,
                 loupe_radius: self.loupe_radius,
                 dither: u32::from(self.dither),
-                _pad0: 0.0,
-                _pad1: 0.0,
+                split_tone_active: u32::from(self.split_tone_amount > 0.0),
+                split_tone_amount: self.split_tone_amount,
+                clipping_warning: u32::from(self.clipping_warning),
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+                shadow_tint: [self.shadow_tint[0], self.shadow_tint[1], self.shadow_tint[2], 0.0],
+                highlight_tint: [
+                    self.highlight_tint[0],
+                    self.highlight_tint[1],
+                    self.highlight_tint[2],
+                    0.0,
+                ],
             };
 
             let upload = if self.needs_upload {
@@ -1144,8 +1262,71 @@ impl TessellatorApp {
                 },
             );
             ui.painter().with_clip_rect(rect).add(callback);
+
+            // Histogram overlay sits on top of the viewport in the corner.
+            if self.show_histogram
+                && let Some(image) = self.current_image.as_ref()
+            {
+                draw_histogram_overlay(ui, &image.histogram, rect);
+            }
         });
     }
+}
+
+/// Draw a 256-bin RGB + luma histogram in the top-right corner of `viewport`.
+/// Each channel is plotted as an additive translucent fill so overlapping bins
+/// blend visibly. Luma drawn last in dim white as a reference curve.
+fn draw_histogram_overlay(ui: &egui::Ui, hist: &crate::io::Histogram, viewport: egui::Rect) {
+    const PAD: f32 = 12.0;
+    const W: f32 = 256.0;
+    const H: f32 = 96.0;
+
+    let max = hist.max.max(1) as f32;
+    let top_right = viewport.right_top();
+    let panel_min = egui::pos2(top_right.x - W - PAD, top_right.y + PAD);
+    let panel = egui::Rect::from_min_size(panel_min, egui::vec2(W, H));
+
+    let painter = ui.painter().with_clip_rect(viewport);
+    painter.rect_filled(
+        panel.expand(4.0),
+        4.0,
+        egui::Color32::from_black_alpha(180),
+    );
+
+    let plot = |color: egui::Color32, bins: &[u32; 256]| {
+        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(256);
+        for (i, &v) in bins.iter().enumerate() {
+            let x = panel.left() + i as f32;
+            let h = (v as f32 / max) * H;
+            pts.push(egui::pos2(x, panel.bottom() - h));
+        }
+        // Filled polygon: down to baseline at both ends, then trace the curve.
+        let mut filled: Vec<egui::Pos2> = Vec::with_capacity(258);
+        filled.push(egui::pos2(panel.left(), panel.bottom()));
+        filled.extend(pts.iter().copied());
+        filled.push(egui::pos2(panel.right(), panel.bottom()));
+        painter.add(egui::Shape::convex_polygon(
+            filled,
+            color,
+            egui::Stroke::NONE,
+        ));
+    };
+
+    plot(egui::Color32::from_rgba_unmultiplied(255, 60, 60, 130), &hist.r);
+    plot(egui::Color32::from_rgba_unmultiplied(60, 220, 60, 130), &hist.g);
+    plot(egui::Color32::from_rgba_unmultiplied(80, 120, 255, 130), &hist.b);
+    // Luma overlay as a thin stroke so it sits readably on top of the channel fills.
+    let luma_pts: Vec<egui::Pos2> = (0..256)
+        .map(|i| {
+            let x = panel.left() + i as f32;
+            let h = (hist.luma[i] as f32 / max) * H;
+            egui::pos2(x, panel.bottom() - h)
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        luma_pts,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(200)),
+    ));
 }
 
 fn format_bytes(n: u64) -> String {

@@ -25,8 +25,14 @@ struct Settings {
     loupe_center_screen: vec2<f32>,
     loupe_radius: f32,
     dither: u32,
-    _pad0: f32,
-    _pad1: f32,
+    split_tone_active: u32,
+    split_tone_amount: f32,
+    clipping_warning: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    shadow_tint: vec3<f32>,
+    highlight_tint: vec3<f32>,
 };
 
 @group(0) @binding(0) var t_diffuse: texture_2d<f32>;
@@ -134,11 +140,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // Split-tone: lerp between shadow and highlight tints by per-pixel luma,
+    // multiply (tint scaled by 2 so a neutral 0.5 tint preserves brightness),
+    // then mix toward original by `amount`.
+    if (settings.split_tone_active != 0u && settings.split_tone_amount > 0.0) {
+        let luma = dot(final_color, vec3<f32>(0.299, 0.587, 0.114));
+        let tint = mix(settings.shadow_tint, settings.highlight_tint, luma);
+        let toned = final_color * tint * 2.0;
+        final_color = mix(final_color, toned, settings.split_tone_amount);
+    }
+
     // Dither to break up subtle banding from grayscale + overlay blends when
     // quantizing back down to 8-bit at scanout. Cost: one sin + one fract.
     if (settings.dither != 0u) {
         let n = tri_noise(in.clip_position.xy) / 255.0;
         final_color = final_color + vec3<f32>(n);
+    }
+
+    // Clipping warning: any channel at the extremes flagged with hi-vis colors.
+    // Magenta = highlight clip, cyan = shadow clip. Sampled from the original
+    // texture color so split-tone/grayscale don't false-trigger it.
+    if (settings.clipping_warning != 0u) {
+        let hi = max(max(color.r, color.g), color.b);
+        let lo = min(min(color.r, color.g), color.b);
+        if (hi >= 254.0 / 255.0) {
+            final_color = vec3<f32>(1.0, 0.0, 1.0);
+        } else if (lo <= 1.0 / 255.0) {
+            final_color = vec3<f32>(0.0, 1.0, 1.0);
+        }
     }
 
     return vec4<f32>(final_color, color.a);

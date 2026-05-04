@@ -24,13 +24,20 @@ pub struct ShaderSettings {
     pub loupe_center_screen: [f32; 2],
     pub loupe_radius: f32,
     pub dither: u32,
-    pub _pad0: f32,
-    pub _pad1: f32,
+    pub split_tone_active: u32,
+    pub split_tone_amount: f32,
+    pub clipping_warning: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    /// 4th component is WGSL vec3 padding; ignored by the shader.
+    pub shadow_tint: [f32; 4],
+    pub highlight_tint: [f32; 4],
 }
 
-// Layout matches WGSL Settings: 48B mat3x3 + four 16B blocks of scalars/vec2s.
-// A future field reorder that breaks WGSL alignment will fail to compile.
-const _: () = assert!(std::mem::size_of::<ShaderSettings>() == 112);
+// Layout matches WGSL Settings: 48B mat3x3 + scalars + two 16B vec3 blocks.
+// A future field reorder that breaks WGSL alignment will fail to compile here.
+const _: () = assert!(std::mem::size_of::<ShaderSettings>() == 160);
 
 pub struct TessellatorResources {
     pipeline: wgpu::RenderPipeline,
@@ -268,16 +275,35 @@ fn create_image_texture(
     image: &DecodedImage,
     label_suffix: &str,
 ) -> wgpu::Texture {
-    let width = image.width;
-    let height = image.height;
-    let mip_level_count = image.mips.len() as u32;
-    log::info!(
-        "Uploading {} texture: {}x{} ({} mips)",
-        label_suffix,
-        width,
-        height,
-        mip_level_count
-    );
+    let max_dim = device.limits().max_texture_dimension_2d;
+
+    // Find the first mip whose dimensions fit the device's texture-size cap.
+    // For images larger than that cap (rare on M1+ which support 16384, common
+    // on older GPUs at 8192), we upload from a downscaled mip level instead
+    // of failing. CPU-side mip chain stays full-resolution so the eyedropper
+    // can still sample original pixels.
+    let lod_offset = image
+        .mips
+        .iter()
+        .position(|mip| mip.width <= max_dim && mip.height <= max_dim)
+        .unwrap_or_else(|| image.mips.len() - 1);
+    let upload_mips = &image.mips[lod_offset..];
+    let width = upload_mips[0].width;
+    let height = upload_mips[0].height;
+    let mip_level_count = upload_mips.len() as u32;
+
+    if lod_offset > 0 {
+        log::warn!(
+            "Image {}x{} exceeds device max_texture_dimension_2d={}; uploading from mip {} ({}x{}, {} mips)",
+            image.width, image.height, max_dim, lod_offset, width, height, mip_level_count
+        );
+    } else {
+        log::info!(
+            "Uploading {} texture: {}x{} ({} mips)",
+            label_suffix, width, height, mip_level_count
+        );
+    }
+
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tessellator.image_texture"),
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -288,7 +314,7 @@ fn create_image_texture(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for (level, mip) in image.mips.iter().enumerate() {
+    for (level, mip) in upload_mips.iter().enumerate() {
         upload_mip(queue, &texture, level as u32, &mip.rgba, mip.width, mip.height);
     }
     texture
