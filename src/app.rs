@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::annotation::AnnotationLayer;
+use crate::pinboard::{self, DragState, PinnedItem, Pinboard};
 use crate::cache::ImageCache;
 use crate::gpu::{AnnotationUpload, CompareUpload, GridUpload, ShaderSettings, TessellatorCallback};
 use crate::io::{self, CancelToken, DecodedImage, ImagePurpose, Message};
@@ -163,6 +164,10 @@ pub struct TessellatorApp {
     /// Currently displayed image (kept for eyedropper sampling). `None` means
     /// no image is shown.
     current_image: Option<Arc<DecodedImage>>,
+    /// Path that the currently-uploaded `current_image` was decoded from.
+    /// Used to detect "selection has moved past the displayed image" so
+    /// the viewport can show a spinner instead of stale content.
+    current_image_path: Option<PathBuf>,
     /// `current_image` has changed; the next paint callback should re-upload.
     needs_upload: bool,
     current_image_size: Option<[u32; 2]>,
@@ -232,6 +237,12 @@ pub struct TessellatorApp {
     /// Bumped each time grid mode is started; in-flight decodes that arrive
     /// stale (i.e. with a different generation) are dropped.
     grid_generation: u64,
+
+    /// Pinboard / moodboard state. Always-allocated; `pinboard_mode`
+    /// controls whether the viewport renders it. Items persist across
+    /// pinboard_mode toggles within a session but are not saved to disk.
+    pinboard: Pinboard,
+    pinboard_mode: bool,
 
     show_histogram: bool,
     show_color_panel: bool,
@@ -348,6 +359,7 @@ impl TessellatorApp {
             view: ViewState::identity(),
             recursion_depth: saved.recursion_depth.unwrap_or(DEFAULT_RECURSION_DEPTH),
             current_image: None,
+            current_image_path: None,
             needs_upload: false,
             current_image_size: None,
             compare_image: None,
@@ -377,6 +389,8 @@ impl TessellatorApp {
             grid_images: Vec::new(),
             grid_dirty: [false; 3],
             grid_generation: 0,
+            pinboard: Pinboard::default(),
+            pinboard_mode: false,
             show_histogram: saved.show_histogram,
             show_color_panel: false,
             clipping_warning: saved.clipping_warning,
@@ -437,6 +451,7 @@ impl TessellatorApp {
         self.direction_streak = 0;
         self.current_image_size = None;
         self.current_image = None;
+        self.current_image_path = None;
         self.needs_upload = false;
         self.cursor_pixel = None;
         self.clear_compare();
@@ -616,6 +631,9 @@ impl TessellatorApp {
             .selected_index
             .and_then(|i| self.files.get(i))
             .map(|f| f.path.clone());
+        // Record which path's pixels are now loaded so the viewport can tell
+        // "still loading" from "displayed" without inspecting in-flight queues.
+        self.current_image_path = new_path.clone();
         if new_path != self.annotation_path {
             self.save_current_annotation();
             self.annotation = new_path
@@ -633,6 +651,40 @@ impl TessellatorApp {
     /// (`unsaved`). The actual encode + write runs on a one-off background
     /// thread; PNG encoding a multi-MP RGBA buffer can take seconds and
     /// would otherwise block the UI on every drag-stop.
+    /// Pin the currently-selected sidebar image to the moodboard. Default
+    /// world size is derived from the loaded image's aspect (or the
+    /// thumbnail's aspect, or 1:1) at a fixed 240-unit long edge. Items
+    /// stack near `view_center` with a small per-item offset so a rapid
+    /// run of `B` presses fans them out instead of hiding under each other.
+    fn pin_selected_to_board(&mut self) {
+        let Some(i) = self.selected_index else { return };
+        let Some(entry) = self.files.get(i) else { return };
+        let path = entry.path.clone();
+        // Derive aspect: prefer the full-image dims if currently loaded
+        // (most accurate), fall back to thumbnail dims, then 1:1.
+        let aspect = if Some(&path) == self.current_image_path.as_ref()
+            && let Some([w, h]) = self.current_image_size
+        {
+            (w as f32) / (h.max(1) as f32)
+        } else if let Some(tex) = entry.thumbnail.as_ref() {
+            let [w, h] = tex.size();
+            (w as f32) / (h.max(1) as f32)
+        } else {
+            1.0
+        };
+        let long_edge = 240.0;
+        let size = if aspect >= 1.0 {
+            egui::vec2(long_edge, long_edge / aspect)
+        } else {
+            egui::vec2(long_edge * aspect, long_edge)
+        };
+        // Cascade-offset each new pin so they don't perfectly overlap.
+        let n = self.pinboard.items.len() as f32;
+        let cascade = egui::vec2(20.0 * (n % 8.0), 20.0 * (n % 8.0));
+        let pos = self.pinboard.view_center + cascade - size * 0.5;
+        self.pinboard.add(PinnedItem { path, pos, size });
+    }
+
     /// Flip the starred state of the currently-selected file and write the
     /// matching sidecar to disk on a background thread. Sidecar presence is
     /// the source of truth; toggling off removes the file.
@@ -935,12 +987,14 @@ impl TessellatorApp {
                         }
                         ImagePurpose::Preload => {
                             // Cached above; if the user has since navigated to
-                            // this image, surface it now.
+                            // this image, surface it now. Compare by path
+                            // (not by dimensions) - two images in the same
+                            // folder often share dimensions, and a dim-only
+                            // check would silently skip the display, leaving
+                            // the loading spinner stuck up forever.
                             if let Some(i) = self.selected_index
                                 && self.files.get(i).map(|f| &f.path) == Some(&path)
-                                && self.current_image_size.is_none_or(|sz| {
-                                    sz != [image.width, image.height]
-                                })
+                                && self.current_image_path.as_deref() != Some(&path)
                             {
                                 self.show_image(image);
                             }
@@ -969,15 +1023,35 @@ impl TessellatorApp {
                 }
                 Message::ImageFailed { path, error, purpose } => {
                     self.pending_image_requests.remove(&path);
-                    if let ImagePurpose::Display { generation } = purpose {
-                        if generation != self.high_res_generation {
-                            continue;
+                    let is_current_selection = self
+                        .selected_index
+                        .and_then(|i| self.files.get(i))
+                        .map(|f| f.path == path)
+                        .unwrap_or(false);
+                    match purpose {
+                        ImagePurpose::Display { generation } => {
+                            if generation != self.high_res_generation {
+                                continue;
+                            }
+                            self.last_load_error = Some(format!(
+                                "Failed to load {}: {}",
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                                error
+                            ));
                         }
-                        self.last_load_error = Some(format!(
-                            "Failed to load {}: {}",
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                            error
-                        ));
+                        ImagePurpose::Preload if is_current_selection => {
+                            // The preload that select_image was relying on
+                            // failed - the user is staring at a loading
+                            // spinner with no in-flight work. Surface the
+                            // failure as a real load error so they aren't
+                            // stuck.
+                            self.last_load_error = Some(format!(
+                                "Failed to load {}: {}",
+                                path.file_name().unwrap_or_default().to_string_lossy(),
+                                error
+                            ));
+                        }
+                        _ => {}
                     }
                 }
                 Message::FolderChanged => {
@@ -1080,6 +1154,15 @@ impl TessellatorApp {
         if p.toggle_starred_filter {
             self.show_only_starred = !self.show_only_starred;
         }
+        if p.toggle_pinboard {
+            self.pinboard_mode = !self.pinboard_mode;
+        }
+        if p.pin_selected {
+            self.pin_selected_to_board();
+        }
+        if p.delete_pinned && self.pinboard_mode {
+            self.pinboard.remove_selected();
+        }
 
         // Navigation steps through the *visible* (post-filter) list so a
         // "starred only" view doesn't silently skip past hidden entries.
@@ -1152,7 +1235,11 @@ impl eframe::App for TessellatorApp {
             self.show_tools_panel(ctx);
             self.show_status_bar(ctx);
         }
-        self.show_viewport(ctx);
+        if self.pinboard_mode {
+            self.show_pinboard(ctx);
+        } else {
+            self.show_viewport(ctx);
+        }
         self.show_color_window(ctx);
         self.show_drop_overlay(ctx);
     }
@@ -1246,7 +1333,11 @@ impl TessellatorApp {
                 });
                 ui.separator();
 
-                let row_height = 40.0;
+                // Row layout: 44px tall, 4px outer gap. Big enough for a
+                // 36px rounded thumbnail with breathing room on both sides.
+                let row_height = 44.0;
+                let row_inner_h = row_height - 4.0;
+                let thumb_size = 36.0;
                 let viewport_h = ui.available_height();
 
                 // visible: position-in-list -> index into self.files. When
@@ -1275,23 +1366,103 @@ impl TessellatorApp {
                         let i = visible[pos];
                         let entry = &self.files[i];
                         let is_selected = self.selected_index == Some(i);
-                        let label_resp = ui
-                            .horizontal(|ui| {
-                                if let Some(texture) = &entry.thumbnail {
-                                    ui.image((texture.id(), egui::vec2(32.0, 32.0)));
-                                } else {
-                                    ui.allocate_space(egui::vec2(32.0, 32.0));
-                                }
-                                let star_btn = ui
-                                    .small_button(if entry.starred { "★" } else { "☆" })
+
+                        // Reserve the full row rectangle so we can paint a
+                        // selection / hover background under everything,
+                        // then lay out the children on top.
+                        let avail_w = ui.available_width();
+                        let (row_rect, row_resp) = ui.allocate_exact_size(
+                            egui::vec2(avail_w, row_inner_h),
+                            egui::Sense::click(),
+                        );
+                        let visuals = ui.style().visuals.clone();
+                        if is_selected {
+                            ui.painter().rect_filled(
+                                row_rect,
+                                6.0,
+                                visuals.selection.bg_fill,
+                            );
+                        } else if row_resp.hovered() {
+                            ui.painter().rect_filled(
+                                row_rect,
+                                6.0,
+                                visuals.widgets.hovered.bg_fill,
+                            );
+                        }
+
+                        // Children laid out inside the row rect with a small
+                        // inset so the rounded fill has padding.
+                        let inner_rect = row_rect.shrink2(egui::vec2(6.0, 4.0));
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(inner_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+
+                        // Thumbnail (or a faint placeholder while loading).
+                        let thumb_vec = egui::vec2(thumb_size, thumb_size);
+                        if let Some(texture) = &entry.thumbnail {
+                            child.add(
+                                egui::Image::new((texture.id(), thumb_vec))
+                                    .corner_radius(4.0),
+                            );
+                        } else {
+                            let (rect, _) =
+                                child.allocate_exact_size(thumb_vec, egui::Sense::hover());
+                            child.painter().rect_filled(
+                                rect,
+                                4.0,
+                                visuals.faint_bg_color,
+                            );
+                        }
+
+                        child.add_space(8.0);
+
+                        // Reserve space for the star at the right edge so the
+                        // filename has a definite max width to truncate
+                        // against (otherwise the row's available width would
+                        // be unbounded and Truncate degenerates to Extend).
+                        let star_glyph = if entry.starred { "★" } else { "☆" };
+                        let star_w = 22.0;
+                        let name_max_w =
+                            (child.available_width() - star_w - 4.0).max(0.0);
+
+                        // Filename. Bold when selected; truncated to one line
+                        // with an ellipsis. Tooltip shows the full name on
+                        // hover so a long filename is never lost.
+                        let name_text = if is_selected {
+                            egui::RichText::new(&entry.name)
+                                .strong()
+                                .color(visuals.selection.stroke.color)
+                        } else {
+                            egui::RichText::new(&entry.name)
+                        };
+                        let name_resp = child.add_sized(
+                            egui::vec2(name_max_w, row_inner_h),
+                            egui::Label::new(name_text)
+                                .truncate()
+                                .selectable(false),
+                        );
+                        name_resp.on_hover_text(&entry.name);
+
+                        // Star button pinned to the right of the row.
+                        child.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let star = ui
+                                    .small_button(star_glyph)
                                     .on_hover_text("Toggle star (S)");
-                                if star_btn.clicked() {
+                                if star.clicked() {
                                     star_toggle = Some(i);
                                 }
-                                ui.selectable_label(is_selected, &entry.name)
-                            })
-                            .inner;
-                        if label_resp.clicked() {
+                            },
+                        );
+
+                        // The whole row is a single click target for selection.
+                        // Star clicks are absorbed by the button above (which
+                        // doesn't propagate), so a click here means "select
+                        // this row".
+                        if row_resp.clicked() {
                             clicked = Some(i);
                         }
                     }
@@ -1439,6 +1610,17 @@ impl TessellatorApp {
                 }
                 ui.toggle_value(&mut self.compact, "Compact")
                     .on_hover_text("Hide all panels - just the image (\\)");
+                ui.separator();
+                ui.toggle_value(&mut self.pinboard_mode, "Pinboard")
+                    .on_hover_text("Moodboard canvas - drag, resize, arrange (P)");
+                if self.pinboard_mode
+                    && ui
+                        .button("Pin selected")
+                        .on_hover_text("Add the current image to the pinboard (B)")
+                        .clicked()
+                {
+                    self.pin_selected_to_board();
+                }
             });
         });
     }
@@ -1628,6 +1810,242 @@ impl TessellatorApp {
         );
     }
 
+    fn show_pinboard(&mut self, ctx: &egui::Context) {
+        // A lookup from path -> thumbnail texture so we can render any
+        // pinned item even if the user has scrolled the sidebar past it.
+        // (The sidebar only requests thumbs for visible rows, so a pin made
+        // earlier might no longer have its thumbnail in the file entry.)
+        let mut to_request: Vec<PathBuf> = Vec::new();
+        let pinboard_id = egui::Id::new("pinboard_canvas");
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let rect = ui.max_rect();
+            // Soft fill so the moodboard plane is visually distinct from
+            // the single-image viewport.
+            ui.painter().rect_filled(
+                rect,
+                0.0,
+                ui.style().visuals.extreme_bg_color,
+            );
+
+            let response = ui.interact(
+                rect,
+                pinboard_id,
+                egui::Sense::click_and_drag(),
+            );
+            let mouse_pos = ui.input(|i| i.pointer.hover_pos());
+
+            // Scroll-to-zoom around the cursor, like the single-image
+            // viewport. Keeping it on the same gesture means muscle memory
+            // transfers between modes.
+            if response.hovered() {
+                let scroll_dy = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll_dy != 0.0
+                    && let Some(mp) = mouse_pos
+                {
+                    let world_before = self.pinboard.screen_to_world(mp, rect);
+                    let factor = (scroll_dy * 0.005).exp();
+                    self.pinboard.view_scale =
+                        (self.pinboard.view_scale * factor).clamp(0.05, 20.0);
+                    let world_after = self.pinboard.screen_to_world(mp, rect);
+                    self.pinboard.view_center += world_before - world_after;
+                }
+            }
+
+            // Drag-start dispatch: figure out what the user grabbed and
+            // record a DragState. We consume `press_origin` rather than the
+            // current pointer pos so the hit-test reflects where the drag
+            // actually began.
+            if response.drag_started() {
+                let mp = ui
+                    .input(|i| i.pointer.press_origin())
+                    .unwrap_or(rect.center());
+                let world = self.pinboard.screen_to_world(mp, rect);
+                // Corner-handle hit radius is 8 screen pixels expressed in
+                // world units so it stays a constant on-screen size.
+                let handle_world = 8.0 / self.pinboard.view_scale.max(0.001);
+                if let Some((idx, corner)) =
+                    self.pinboard.hit_test(world, handle_world)
+                {
+                    let raised = self.pinboard.raise(idx);
+                    let item = &self.pinboard.items[raised];
+                    self.pinboard.drag = match corner {
+                        Some(c) => {
+                            let aspect = (item.size.x / item.size.y.max(1e-3)).max(0.01);
+                            DragState::Resize {
+                                idx: raised,
+                                corner: c,
+                                start_pos: item.pos,
+                                start_size: item.size,
+                                aspect,
+                            }
+                        }
+                        None => DragState::Move {
+                            idx: raised,
+                            anchor: world - item.pos,
+                        },
+                    };
+                } else {
+                    self.pinboard.selected = None;
+                    self.pinboard.drag = DragState::Pan;
+                }
+            }
+
+            // Drag-in-progress dispatch.
+            if response.dragged() {
+                match &self.pinboard.drag {
+                    DragState::Move { idx, anchor } => {
+                        let idx = *idx;
+                        let anchor = *anchor;
+                        if let Some(mp) = mouse_pos {
+                            let world = self.pinboard.screen_to_world(mp, rect);
+                            if let Some(item) = self.pinboard.items.get_mut(idx) {
+                                item.pos = world - anchor;
+                            }
+                        }
+                    }
+                    DragState::Resize {
+                        idx,
+                        corner,
+                        start_pos,
+                        start_size,
+                        aspect,
+                    } => {
+                        let (idx, corner, sp, ss, asp) =
+                            (*idx, *corner, *start_pos, *start_size, *aspect);
+                        if let Some(mp) = mouse_pos {
+                            let world = self.pinboard.screen_to_world(mp, rect);
+                            let (new_pos, new_size) =
+                                pinboard::resize_uniform(corner, sp, ss, asp, world);
+                            if let Some(item) = self.pinboard.items.get_mut(idx) {
+                                item.pos = new_pos;
+                                item.size = new_size;
+                            }
+                        }
+                    }
+                    DragState::Pan => {
+                        let delta = response.drag_delta();
+                        self.pinboard.view_center -= egui::vec2(
+                            delta.x / self.pinboard.view_scale.max(0.001),
+                            delta.y / self.pinboard.view_scale.max(0.001),
+                        );
+                    }
+                    DragState::None => {}
+                }
+            }
+
+            if response.drag_stopped() {
+                self.pinboard.drag = DragState::None;
+            }
+
+            // Render. `items` is z-sorted (back-to-front by Vec order); we
+            // paint in iteration order so later items occlude earlier.
+            let painter = ui.painter().with_clip_rect(rect);
+            let item_count = self.pinboard.items.len();
+            for idx in 0..item_count {
+                let item = self.pinboard.items[idx].clone();
+                let world_rect = egui::Rect::from_min_size(
+                    egui::pos2(item.pos.x, item.pos.y),
+                    egui::vec2(item.size.x, item.size.y),
+                );
+                let screen_rect = self
+                    .pinboard
+                    .world_to_screen_rect(world_rect, rect);
+
+                // Skip drawing if entirely off-screen (cheap culling).
+                if !screen_rect.intersects(rect) {
+                    continue;
+                }
+
+                // Drop shadow for a sleeker look.
+                painter.rect_filled(
+                    screen_rect.translate(egui::vec2(2.0, 4.0)),
+                    4.0,
+                    egui::Color32::from_black_alpha(80),
+                );
+
+                // Look up the thumbnail by path. If the sidebar hasn't
+                // requested it yet (item is below the fold), queue it.
+                let entry = self.files.iter().find(|f| f.path == item.path);
+                let drew_image = if let Some(e) = entry
+                    && let Some(tex) = e.thumbnail.as_ref()
+                {
+                    painter.image(
+                        tex.id(),
+                        screen_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    true
+                } else {
+                    painter.rect_filled(
+                        screen_rect,
+                        4.0,
+                        ui.style().visuals.faint_bg_color,
+                    );
+                    false
+                };
+                // Schedule a thumbnail request for items whose entry exists
+                // but hasn't been thumbnailed yet (not in current view rows).
+                if !drew_image
+                    && let Some(e) = entry
+                    && e.thumbnail.is_none()
+                    && !self.requested_thumbnails.contains(&e.path)
+                {
+                    to_request.push(e.path.clone());
+                }
+
+                // Selection chrome: outline + four corner handles.
+                if self.pinboard.selected == Some(idx) {
+                    painter.rect_stroke(
+                        screen_rect,
+                        4.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 180, 255)),
+                        egui::StrokeKind::Outside,
+                    );
+                    let handle = 8.0;
+                    for p in [
+                        screen_rect.left_top(),
+                        screen_rect.right_top(),
+                        screen_rect.left_bottom(),
+                        screen_rect.right_bottom(),
+                    ] {
+                        let r = egui::Rect::from_center_size(
+                            p,
+                            egui::vec2(handle, handle),
+                        );
+                        painter.rect_filled(r, 2.0, egui::Color32::WHITE);
+                        painter.rect_stroke(
+                            r,
+                            2.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+            }
+
+            // Empty-state hint so a fresh pinboard isn't a confusing void.
+            if self.pinboard.items.is_empty() {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Pinboard - select an image and press B to pin it",
+                    egui::FontId::proportional(16.0),
+                    ui.style().visuals.weak_text_color(),
+                );
+            }
+        });
+
+        // Issue any deferred thumbnail requests for off-screen pins.
+        for path in to_request {
+            if !self.requested_thumbnails.contains(&path) {
+                self.requested_thumbnails.insert(path.clone());
+                io::request_thumbnail(path, self.sender.clone(), ctx.clone());
+            }
+        }
+    }
+
     fn show_viewport(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.last_load_error {
@@ -1637,6 +2055,40 @@ impl TessellatorApp {
             if self.selected_index.is_none() {
                 ui.heading("Viewer");
                 ui.label("Select an image to view, or use the arrow keys to navigate.");
+                return;
+            }
+
+            // If the displayed image's path doesn't match the selected file,
+            // a decode is in flight or just failed. Show a spinner only
+            // while a request is genuinely pending; if there's nothing
+            // queued, fall through so any error label at the top is the
+            // only thing the user sees (and the previous image isn't shown).
+            let selected_path = self
+                .selected_index
+                .and_then(|i| self.files.get(i))
+                .map(|f| f.path.as_path());
+            let stale = selected_path.is_some()
+                && selected_path != self.current_image_path.as_deref();
+            let waiting = selected_path
+                .map(|p| self.pending_image_requests.contains_key(p))
+                .unwrap_or(false);
+            if stale || self.current_image_size.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        if waiting {
+                            ui.add(egui::Spinner::new().size(48.0));
+                            ui.label("Loading...");
+                        } else if self.last_load_error.is_none() {
+                            ui.label("(no image)");
+                        }
+                    });
+                });
+                // Keep the egui frame ticking so the spinner animates while
+                // the decode worker runs. Without this we'd repaint only on
+                // user input and the spinner would freeze.
+                if waiting {
+                    ctx.request_repaint();
+                }
                 return;
             }
 
@@ -2115,6 +2567,9 @@ struct Pressed {
     toggle_compact: bool,
     toggle_star: bool,
     toggle_starred_filter: bool,
+    toggle_pinboard: bool,
+    pin_selected: bool,
+    delete_pinned: bool,
     copy_path: bool,
 }
 
@@ -2156,6 +2611,10 @@ fn read_pressed_keys(ctx: &egui::Context) -> Pressed {
             toggle_compact: i.consume_key(Modifiers::NONE, Key::Backslash),
             toggle_star: i.consume_key(Modifiers::NONE, Key::S),
             toggle_starred_filter: i.consume_key(Modifiers::SHIFT, Key::S),
+            toggle_pinboard: i.consume_key(Modifiers::NONE, Key::P),
+            pin_selected: i.consume_key(Modifiers::NONE, Key::B),
+            delete_pinned: i.consume_key(Modifiers::NONE, Key::Delete)
+                || i.consume_key(Modifiers::NONE, Key::Backspace),
             copy_path: !any_focused && i.consume_key(Modifiers::COMMAND, Key::C),
         }
     })

@@ -6,6 +6,7 @@ mod app;
 mod cache;
 mod gpu;
 mod io;
+mod pinboard;
 mod view;
 mod watcher;
 
