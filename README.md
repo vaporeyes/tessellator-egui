@@ -2,15 +2,17 @@
 
 A high-performance photo viewer for artists, built in Rust on `eframe` + WGPU.
 
-Designed for the "flip rapidly through a folder of references" workflow, with extras for visual analysis: composition overlays, A/B compare, magnifier loupe, eyedropper.
+Designed for the "flip rapidly through a folder of references" workflow, with extras for visual analysis: composition overlays, A/B compare, magnifier loupe, eyedropper, value-study, annotation paint-over, and a moodboard canvas.
+
+![Tessellator screenshot](screenshots/tessellator.png)
 
 ## Features
 
-- **Fast browsing.** Folder list with thumbnails, keyboard navigation, neighbor preload, and an LRU image cache so flipping back and forth is instant.
+- **Fast browsing.** Folder list with thumbnails, source dimensions, keyboard navigation, neighbor preload, and an LRU image cache so flipping back and forth is instant.
 - **GPU-accelerated viewport.** WGPU with mipmaps and trilinear filtering. Smooth zoom-to-cursor and drag-to-pan.
 - **Fit / Fill / 100% / arbitrary zoom.** One-key access via `F`, `Shift+F`, `1`.
 - **Composition overlays.** Rule of thirds, golden ratio, diagonal cross, custom grid - all with adjustable opacity.
-- **A/B compare.** Pick a second image; drag the divider to reveal one over the other at the same zoom and pan.
+- **A/B compare.** Pick a second image; drag the divider (slider or directly on the image) to reveal one over the other at the same zoom and pan.
 - **Grid compare (A/B/C/D).** Pick 2-4 images and view them side-by-side (1xN strip or 2x2 grid), each aspect-fitted in its tile, sharing a single zoom + pan.
 - **Loupe / magnifier.** Hold `Alt` to get a circular magnifier centered on the cursor.
 - **Eyedropper.** Hovering shows the exact RGB / hex of the pixel under the cursor in the status bar.
@@ -100,11 +102,36 @@ The sidebar's "Recent" button shows the last few folders you've opened.
 
 ## Mouse
 
+In the single-image viewport:
+
 | Action | Effect |
 |---|---|
 | Scroll | Zoom in/out around cursor |
 | Drag | Pan |
+| Drag near compare divider | Move the A/B split point |
+| Drag while annotation mode is on | Paint a stroke |
 | Hover | Eyedropper (status bar) |
+| `Alt`-hover | Magnifier loupe |
+
+In pinboard mode:
+
+| Action | Effect |
+|---|---|
+| Scroll | Zoom canvas around cursor |
+| Drag empty space | Pan canvas |
+| Drag a tile | Move it (raises to top of z-stack) |
+| Drag a tile's corner | Resize, aspect-locked |
+
+## Sidecar files
+
+Tessellator stores per-image metadata next to the original file so the originals are never modified and the metadata syncs naturally with cloud / backup tools:
+
+| File | Purpose |
+|---|---|
+| `photo.jpg.tess.png` | Annotation layer (transparent PNG, same dimensions as the source) |
+| `photo.jpg.tess.json` | Star / tag metadata (presence-based for now) |
+
+Erasing every stroke or clicking the **Clear** button deletes the annotation sidecar; un-starring deletes the JSON sidecar. No empty files left behind.
 
 ## Supported formats
 
