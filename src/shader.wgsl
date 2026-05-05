@@ -34,7 +34,7 @@ struct Settings {
     grid_active: u32,
     grid_count: u32,
     screen_aspect: f32,
-    _pad_grid: u32,
+    manual_rotation: u32,
     tile_image_aspects: vec4<f32>,
     shadow_tint: vec3<f32>,
     highlight_tint: vec3<f32>,
@@ -76,6 +76,17 @@ fn diag_alpha(uv: vec2<f32>) -> f32 {
 fn tri_noise(p: vec2<f32>) -> f32 {
     let n = fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
     return n - 0.5;
+}
+
+/// Map a display-orientation UV to the source texture's UV given a 90-deg
+/// clockwise rotation count (0..=3). The quad's geometry already uses the
+/// display-orientation aspect, so this just remaps which texel each
+/// fragment samples from.
+fn rotate_uv(uv: vec2<f32>, rot: u32) -> vec2<f32> {
+    if (rot == 1u) { return vec2<f32>(uv.y, 1.0 - uv.x); }
+    if (rot == 2u) { return vec2<f32>(1.0 - uv.x, 1.0 - uv.y); }
+    if (rot == 3u) { return vec2<f32>(1.0 - uv.y, uv.x); }
+    return uv;
 }
 
 @fragment
@@ -152,9 +163,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
     } else if (settings.compare_active != 0u && sample_uv.x > settings.compare_divider) {
-        color = textureSample(t_compare, s_diffuse, sample_uv);
+        let tex_uv = rotate_uv(sample_uv, settings.manual_rotation);
+        color = textureSample(t_compare, s_diffuse, tex_uv);
     } else {
-        color = textureSample(t_diffuse, s_diffuse, sample_uv);
+        let tex_uv = rotate_uv(sample_uv, settings.manual_rotation);
+        color = textureSample(t_diffuse, s_diffuse, tex_uv);
     }
 
     let gray = dot(color.rgb, vec3<f32>(0.299, 0.587, 0.114));
@@ -237,7 +250,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // blended on top of all colour effects so pen strokes stay legible
     // regardless of grayscale/posterize/split-tone.
     if (settings.annotation_active != 0u) {
-        let ann = textureSample(t_annotation, s_diffuse, sample_uv);
+        let ann_uv = rotate_uv(sample_uv, settings.manual_rotation);
+        let ann = textureSample(t_annotation, s_diffuse, ann_uv);
         final_color = mix(final_color, ann.rgb, ann.a);
     }
 

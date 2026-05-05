@@ -84,6 +84,8 @@ RUST_LOG=debug cargo run --release
 | `P` | Toggle pinboard / moodboard mode |
 | `B` | Pin currently-selected image to the board |
 | `Delete` / `Backspace` | Remove the selected pinboard item |
+| `R` | Rotate the displayed image 90° clockwise (Shift+R for ccw) |
+| `Cmd+Delete` / `Cmd+Backspace` | Send the current image to the OS trash |
 | `Esc` | Clear compare mode |
 
 ### App

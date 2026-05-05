@@ -37,7 +37,10 @@ pub struct ShaderSettings {
     /// Width / height of the displayed viewport, used so the shader can
     /// derive each tile's aspect ratio for letterboxing.
     pub screen_aspect: f32,
-    pub _pad_grid: u32,
+    /// Manual image rotation in 90-degree clockwise quarters: 0/1/2/3 =
+    /// 0/90/180/270 deg. Source UVs are remapped in-shader so the quad's
+    /// aspect (computed CPU-side) stays in display orientation.
+    pub manual_rotation: u32,
     /// w/h of each tile's source image. Index 0 is the main (current) image,
     /// 1..3 are the user-picked grid additions. Unused slots are 0.0.
     pub tile_image_aspects: [f32; 4],
@@ -48,8 +51,36 @@ pub struct ShaderSettings {
 
 // Layout matches WGSL Settings: 48B mat3x3 + scalars + grid block + two 16B
 // vec3 blocks. A future field reorder that breaks WGSL alignment will fail
-// to compile here.
+// to compile here. Per-field offset asserts below catch silent reorders that
+// keep the same total size but shift uniforms by 4 bytes - a class of bug
+// that previously could only be detected by visual inspection of the shader
+// output.
 const _: () = assert!(std::mem::size_of::<ShaderSettings>() == 192);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, view_matrix) == 0);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, grayscale) == 48);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, overlay_opacity) == 52);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, grid_size) == 56);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, overlay_mode) == 60);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, compare_divider) == 64);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, compare_active) == 68);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, loupe_active) == 72);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, loupe_zoom) == 76);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, loupe_center_uv) == 80);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, loupe_center_screen) == 88);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, loupe_radius) == 96);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, dither) == 100);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, split_tone_active) == 104);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, split_tone_amount) == 108);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, clipping_warning) == 112);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, posterize_active) == 116);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, posterize_levels) == 120);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, annotation_active) == 124);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, grid_active) == 128);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, grid_count) == 132);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, screen_aspect) == 136);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, tile_image_aspects) == 144);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, shadow_tint) == 160);
+const _: () = assert!(std::mem::offset_of!(ShaderSettings, highlight_tint) == 176);
 
 pub struct TessellatorResources {
     pipeline: wgpu::RenderPipeline,

@@ -127,12 +127,21 @@ fn is_jpeg(bytes: &[u8]) -> bool {
 /// Fast-path JPEG decode that uses libjpeg-style DCT scaling. For a 24MP
 /// source and a 128 px thumbnail target this is roughly 64x faster than
 /// decoding the full raster. Returns `None` for non-RGB/L8 pixel formats
-/// (CMYK, 16-bit grayscale) so the caller can fall back.
-fn try_decode_jpeg_scaled(bytes: &[u8], target_min_dim: u16) -> Option<DynamicImage> {
+/// (CMYK, 16-bit grayscale) so the caller can fall back. Returns the
+/// scaled image and the *original* (pre-scale) image dimensions so callers
+/// can report the source resolution to the user.
+fn try_decode_jpeg_scaled(
+    bytes: &[u8],
+    target_min_dim: u16,
+) -> Option<(DynamicImage, (u32, u32))> {
     use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
 
     let mut decoder = JpegDecoder::new(Cursor::new(bytes));
     decoder.read_info().ok()?;
+    // Capture the source dimensions before scaling - decoder.info() reflects
+    // the requested scale after `scale()` is called.
+    let pre_info = decoder.info()?;
+    let original_dims = (pre_info.width as u32, pre_info.height as u32);
 
     // Snap the request to the closest 1/N (N in {1, 2, 4, 8}) DCT scale.
     decoder.scale(target_min_dim, target_min_dim).ok()?;
@@ -142,7 +151,7 @@ fn try_decode_jpeg_scaled(bytes: &[u8], target_min_dim: u16) -> Option<DynamicIm
     let w = info.width as u32;
     let h = info.height as u32;
 
-    match info.pixel_format {
+    let scaled = match info.pixel_format {
         PixelFormat::RGB24 => {
             // Promote to RGBA so downstream paths (thumbnail egui::ColorImage,
             // viewport upload) stay on a single pixel format.
@@ -150,14 +159,15 @@ fn try_decode_jpeg_scaled(bytes: &[u8], target_min_dim: u16) -> Option<DynamicIm
             for px in pixels.chunks_exact(3) {
                 rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
-            image::RgbaImage::from_raw(w, h, rgba).map(DynamicImage::ImageRgba8)
+            image::RgbaImage::from_raw(w, h, rgba).map(DynamicImage::ImageRgba8)?
         }
         PixelFormat::L8 => {
-            image::GrayImage::from_raw(w, h, pixels).map(DynamicImage::ImageLuma8)
+            image::GrayImage::from_raw(w, h, pixels).map(DynamicImage::ImageLuma8)?
         }
         // CMYK32, L16: rare. Fall back to the full image-crate path.
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((scaled, original_dims))
 }
 
 /// Read EXIF orientation directly from JPEG bytes without a full decode.
@@ -534,7 +544,13 @@ pub enum ImagePurpose {
 
 pub enum Message {
     FilesFound(Vec<ScannedFile>),
-    ThumbnailLoaded { path: PathBuf, image: egui::ColorImage },
+    ThumbnailLoaded {
+        path: PathBuf,
+        image: egui::ColorImage,
+        /// Original image dimensions (post-EXIF-orientation) so the sidebar
+        /// can show e.g. "4032 x 3024" without a separate header read.
+        source_dims: (u32, u32),
+    },
     ThumbnailFailed,
     ImageDecoded {
         path: PathBuf,
@@ -611,16 +627,19 @@ pub fn scan_folder(
 pub fn request_thumbnail(path: PathBuf, sender: Sender<Message>, ctx: egui::Context) {
     rayon::spawn(move || {
         // Thumbnails don't need mips - they're sampled near 1:1 by egui.
-        let result = decode_thumbnail(&path);
-        match result {
-            Some(thumbnail) => {
+        match decode_thumbnail(&path) {
+            Some((thumbnail, source_dims)) => {
                 let size = [thumbnail.width() as usize, thumbnail.height() as usize];
                 let pixels = to_rgba8_consuming(thumbnail);
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
                     size,
                     pixels.as_flat_samples().as_slice(),
                 );
-                let _ = sender.send(Message::ThumbnailLoaded { path, image: color_image });
+                let _ = sender.send(Message::ThumbnailLoaded {
+                    path,
+                    image: color_image,
+                    source_dims,
+                });
             }
             None => {
                 log::warn!("Thumbnail decode failed for {:?}", path);
@@ -631,22 +650,24 @@ pub fn request_thumbnail(path: PathBuf, sender: Sender<Message>, ctx: egui::Cont
     });
 }
 
-/// Produce a thumbnail-sized DynamicImage. Tries the JPEG DCT fast-path first
+/// Produce a thumbnail-sized DynamicImage along with the source image's
+/// orientation-corrected dimensions. Tries the JPEG DCT fast-path first
 /// and falls back to the full image-crate decode for non-JPEG or unsupported
-/// JPEG variants. Always applies EXIF orientation so phone photos display
-/// upright.
-fn decode_thumbnail(path: &Path) -> Option<DynamicImage> {
+/// JPEG variants. EXIF orientation is applied so the reported dims match
+/// what the user will see displayed.
+fn decode_thumbnail(path: &Path) -> Option<(DynamicImage, (u32, u32))> {
     let bytes = read_file_bytes(path).ok()?;
     let slice = bytes.as_slice();
 
     // Fast path: JPEG via DCT scale. Request 256 so we have a 2x supersample
     // for the final thumbnail() downsample, which gives smoother edges.
     if is_jpeg(slice)
-        && let Some(mut img) = try_decode_jpeg_scaled(slice, 256)
+        && let Some((mut img, original_dims)) = try_decode_jpeg_scaled(slice, 256)
     {
         let orientation = read_exif_orientation(slice);
         img.apply_orientation(orientation);
-        return Some(img.thumbnail(128, 128));
+        let dims = orient_dims(original_dims, orientation);
+        return Some((img.thumbnail(128, 128), dims));
     }
 
     // Fallback: full decode. We've already read the bytes once via mmap, so
@@ -660,7 +681,23 @@ fn decode_thumbnail(path: &Path) -> Option<DynamicImage> {
     let mut img = DynamicImage::from_decoder(decoder).ok()?;
     drop(bytes);
     img.apply_orientation(orientation);
-    Some(img.thumbnail(128, 128))
+    // After apply_orientation, `img` already reflects the swapped axes, so
+    // its own dimensions are the user-facing source resolution.
+    let dims = (img.width(), img.height());
+    Some((img.thumbnail(128, 128), dims))
+}
+
+/// Apply an EXIF Orientation to a (width, height) pair so the result
+/// matches what `DynamicImage::apply_orientation` would produce.
+fn orient_dims(
+    (w, h): (u32, u32),
+    orientation: image::metadata::Orientation,
+) -> (u32, u32) {
+    use image::metadata::Orientation::*;
+    match orientation {
+        Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH => (h, w),
+        _ => (w, h),
+    }
 }
 
 pub fn request_image(

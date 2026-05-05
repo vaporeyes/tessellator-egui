@@ -30,6 +30,9 @@ pub struct FileEntry {
     /// User-marked favourite. Persisted as a sidecar `<image>.tess.json`
     /// next to the file (presence == starred, for now).
     pub starred: bool,
+    /// Source-image dimensions, populated when the thumbnail decode
+    /// completes. None until the row has been thumbnailed.
+    pub source_dims: Option<(u32, u32)>,
 }
 
 /// Sidecar path for star/tag metadata. Designed to coexist with the annotation
@@ -244,6 +247,18 @@ pub struct TessellatorApp {
     pinboard: Pinboard,
     pinboard_mode: bool,
 
+    /// Manual rotation override in 90-degree clockwise quarters: 0/1/2/3 =
+    /// 0/90/180/270 deg. Layered on top of EXIF auto-orient. Per-session
+    /// (not saved to disk) for now.
+    manual_rotation: u32,
+
+    /// True while a viewport drag is moving the A/B compare divider line.
+    /// Captured at drag-start when the press was within a few pixels of the
+    /// divider in screen space; held until drag_stopped. Pre-empts the pan
+    /// and annotation drag paths so the slider can be tweaked directly on
+    /// the image without chasing it down to the toolbar slider.
+    compare_divider_drag: bool,
+
     show_histogram: bool,
     show_color_panel: bool,
     clipping_warning: bool,
@@ -391,6 +406,8 @@ impl TessellatorApp {
             grid_generation: 0,
             pinboard: Pinboard::default(),
             pinboard_mode: false,
+            compare_divider_drag: false,
+            manual_rotation: 0,
             show_histogram: saved.show_histogram,
             show_color_panel: false,
             clipping_warning: saved.clipping_warning,
@@ -651,6 +668,140 @@ impl TessellatorApp {
     /// (`unsaved`). The actual encode + write runs on a one-off background
     /// thread; PNG encoding a multi-MP RGBA buffer can take seconds and
     /// would otherwise block the UI on every drag-stop.
+    /// Send the currently-selected image to the OS trash, with a confirm
+    /// dialog. Trash semantics (not raw unlink) so a misfired hotkey is
+    /// recoverable. After deletion, advance the selection to the next
+    /// surviving entry and trigger a rescan to pick up sidecar changes.
+    fn delete_selected_to_trash(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.selected_index else { return };
+        let Some(entry) = self.files.get(i) else { return };
+        let path = entry.path.clone();
+        let name = entry.name.clone();
+        let confirm = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Move to Trash")
+            .set_description(format!("Move \"{}\" to the Trash?", name))
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show();
+        if confirm != rfd::MessageDialogResult::Ok {
+            return;
+        }
+        // trash::delete handles the platform-specific OS call (Recycle Bin
+        // on Windows, ~/.Trash on macOS, gio trash on Linux).
+        match trash::delete(&path) {
+            Ok(()) => {
+                log::info!("Trashed {:?}", path);
+                // Move selection forward (or back if we deleted the last).
+                let next = if i + 1 < self.files.len() {
+                    Some(i)
+                } else if i > 0 {
+                    Some(i - 1)
+                } else {
+                    None
+                };
+                self.files.remove(i);
+                self.selected_index = next;
+                if let Some(idx) = next
+                    && let Some(e) = self.files.get(idx)
+                {
+                    let p = e.path.clone();
+                    self.high_res_generation = self.high_res_generation.wrapping_add(1);
+                    if let Some(image) = self.image_cache.get(&p) {
+                        self.show_image(image);
+                    } else {
+                        self.dispatch_image_request(
+                            p,
+                            ImagePurpose::Display { generation: self.high_res_generation },
+                            ctx,
+                        );
+                    }
+                } else {
+                    self.current_image = None;
+                    self.current_image_path = None;
+                    self.current_image_size = None;
+                }
+                // The folder watcher will fire its own rescan, but kick one
+                // off immediately so the sidebar updates without waiting.
+                self.rescan_current_folder(ctx);
+            }
+            Err(e) => {
+                log::warn!("Failed to trash {:?}: {}", path, e);
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Delete failed")
+                    .set_description(format!("Could not trash file: {}", e))
+                    .show();
+            }
+        }
+    }
+
+    /// Rename the currently-selected image. We piggyback on rfd's native
+    /// save dialog (which shows a filename field) since rfd has no plain
+    /// "text input" dialog. The dialog's parent is forced to the image's
+    /// folder; whatever the user types becomes the new filename.
+    fn rename_selected(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.selected_index else { return };
+        let Some(entry) = self.files.get(i) else { return };
+        let path = entry.path.clone();
+        let current_name = entry.name.clone();
+        let parent = match path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return,
+        };
+        let picked = match rfd::FileDialog::new()
+            .set_directory(&parent)
+            .set_file_name(&current_name)
+            .set_title("Rename image")
+            .save_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        // Force same-folder rename: keep only the basename. Rejects empty
+        // basenames (just in case the user erased everything).
+        let Some(new_name_os) = picked.file_name() else { return };
+        let new_name = new_name_os.to_string_lossy().into_owned();
+        if new_name.is_empty() {
+            return;
+        }
+        let new_path = parent.join(&new_name);
+        if new_path == path {
+            return;
+        }
+        if new_path.exists() {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Rename failed")
+                .set_description(format!("\"{}\" already exists.", new_name))
+                .show();
+            return;
+        }
+        match std::fs::rename(&path, &new_path) {
+            Ok(()) => {
+                log::info!("Renamed {:?} -> {:?}", path, new_path);
+                // Also rename any sidecars so they stay attached.
+                let _ = std::fs::rename(
+                    AnnotationLayer::sidecar_path(&path),
+                    AnnotationLayer::sidecar_path(&new_path),
+                );
+                let _ = std::fs::rename(
+                    star_sidecar_path(&path),
+                    star_sidecar_path(&new_path),
+                );
+                self.restore_selection = Some(new_path);
+                self.rescan_current_folder(ctx);
+            }
+            Err(e) => {
+                log::warn!("Rename failed: {}", e);
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Rename failed")
+                    .set_description(format!("Could not rename: {}", e))
+                    .show();
+            }
+        }
+    }
+
     /// Pin the currently-selected sidebar image to the moodboard. Default
     /// world size is derived from the loaded image's aspect (or the
     /// thumbnail's aspect, or 1:1) at a fixed 240-unit long edge. Items
@@ -791,9 +942,11 @@ impl TessellatorApp {
         if index >= self.files.len() {
             return;
         }
-        // Direction tracking must read the *previous* selection, so update it
-        // before mutating selected_index.
-        self.update_direction_streak(index);
+        // Capture prev_index up front so subsequent reorderings of this
+        // function can't accidentally read selected_index after it's been
+        // overwritten - the streak math depends on the *previous* value.
+        let prev_index = self.selected_index;
+        self.update_direction_streak(prev_index, index);
 
         let path = self.files[index].path.clone();
         log::info!(
@@ -831,14 +984,16 @@ impl TessellatorApp {
 
     /// Update `direction_streak` based on the new selection vs the previous.
     /// Same direction extends the streak; reversal or pause resets it.
-    fn update_direction_streak(&mut self, new_index: usize) {
+    /// `prev_index` is passed explicitly so this function can't be silently
+    /// broken by a reorder that reads `selected_index` after assignment.
+    fn update_direction_streak(&mut self, prev_index: Option<usize>, new_index: usize) {
         const STREAK_DEBOUNCE: Duration = Duration::from_millis(500);
         let now = Instant::now();
         let recent = self
             .last_select_time
             .is_some_and(|t| now.duration_since(t) < STREAK_DEBOUNCE);
 
-        let signed_step: i32 = match self.selected_index {
+        let signed_step: i32 = match prev_index {
             Some(prev) if recent => match new_index.cmp(&prev) {
                 std::cmp::Ordering::Greater => 1,
                 std::cmp::Ordering::Less => -1,
@@ -947,6 +1102,7 @@ impl TessellatorApp {
                             path: s.path,
                             size_bytes: s.size_bytes,
                             thumbnail: None,
+                            source_dims: None,
                         })
                         .collect();
                     if let Some(target) = self.restore_selection.take()
@@ -956,7 +1112,7 @@ impl TessellatorApp {
                         self.pending_scroll_to_index = Some(i);
                     }
                 }
-                Message::ThumbnailLoaded { path, image } => {
+                Message::ThumbnailLoaded { path, image, source_dims } => {
                     if let Some(entry) = self.files.iter_mut().find(|f| f.path == path) {
                         let handle = ctx.load_texture(
                             path.to_string_lossy(),
@@ -964,6 +1120,7 @@ impl TessellatorApp {
                             egui::TextureOptions::default(),
                         );
                         entry.thumbnail = Some(handle);
+                        entry.source_dims = Some(source_dims);
                     }
                 }
                 Message::ThumbnailFailed => {
@@ -1070,13 +1227,47 @@ impl TessellatorApp {
             return;
         }
         self.folder_refresh_at = None;
+        log::info!("Watcher triggered re-scan");
+        self.rescan_current_folder(ctx);
+    }
+
+    /// Re-scan the current folder while keeping decoded images and in-flight
+    /// requests alive. Used by the watcher (file added / removed externally)
+    /// and Cmd+R. Distinct from `open_folder` which rebuilds everything from
+    /// scratch - that path threw away ~512 MB of decoded mip chains for what
+    /// is usually just a one-file delta.
+    fn rescan_current_folder(&mut self, ctx: &egui::Context) {
         let Some(folder) = self.folder_path.clone() else { return };
+        // Pin selection to the current file so the scan resolves it back
+        // when the new file list arrives.
         self.restore_selection = self
             .selected_index
             .and_then(|i| self.files.get(i))
             .map(|f| f.path.clone());
-        log::info!("Watcher triggered re-scan of {:?}", folder);
-        self.open_folder(folder, ctx);
+        // The new file list will repopulate these. We keep image_cache,
+        // pending_image_requests, current_image / current_image_path so
+        // navigation back to recently-viewed images stays instant.
+        self.files.clear();
+        self.selected_index = None;
+        self.requested_thumbnails.clear();
+        io::scan_folder(
+            folder.clone(),
+            self.recursion_depth,
+            self.sender.clone(),
+            ctx.clone(),
+        );
+        // Reattach the watcher: the prior one may have been invalidated by
+        // an unmount or rename of the watched path.
+        self.folder_watcher = None;
+        match FolderWatcher::new(
+            &folder,
+            self.recursion_depth > 1,
+            self.sender.clone(),
+            ctx.clone(),
+        ) {
+            Ok(w) => self.folder_watcher = Some(w),
+            Err(e) => log::warn!("Failed to restart folder watcher for {:?}: {}", folder, e),
+        }
     }
 
     /// Read keyboard navigation and view-mode keys and act on them. Uses
@@ -1090,14 +1281,8 @@ impl TessellatorApp {
         {
             self.open_folder(path, ctx);
         }
-        if p.refresh
-            && let Some(folder) = self.folder_path.clone()
-        {
-            self.restore_selection = self
-                .selected_index
-                .and_then(|i| self.files.get(i))
-                .map(|f| f.path.clone());
-            self.open_folder(folder, ctx);
+        if p.refresh && self.folder_path.is_some() {
+            self.rescan_current_folder(ctx);
         }
         if p.escape {
             self.clear_compare();
@@ -1163,6 +1348,15 @@ impl TessellatorApp {
         if p.delete_pinned && self.pinboard_mode {
             self.pinboard.remove_selected();
         }
+        if p.rotate_cw {
+            self.manual_rotation = (self.manual_rotation + 1) & 3;
+        }
+        if p.rotate_ccw {
+            self.manual_rotation = (self.manual_rotation + 3) & 3;
+        }
+        if p.delete_image {
+            self.delete_selected_to_trash(ctx);
+        }
 
         // Navigation steps through the *visible* (post-filter) list so a
         // "starred only" view doesn't silently skip past hidden entries.
@@ -1206,14 +1400,20 @@ impl TessellatorApp {
         }
         for file in dropped {
             let Some(path) = file.path else { continue };
-            let folder = if path.is_dir() {
-                Some(path)
+            let (folder, target) = if path.is_dir() {
+                (Some(path), None)
             } else if path.is_file() {
-                path.parent().map(|p| p.to_path_buf())
+                let parent = path.parent().map(|p| p.to_path_buf());
+                // Stash the dropped file's path so the next FilesFound
+                // handler selects it after the scan completes.
+                (parent, Some(path))
             } else {
-                None
+                (None, None)
             };
             if let Some(folder) = folder {
+                if target.is_some() {
+                    self.restore_selection = target;
+                }
                 self.open_folder(folder, ctx);
                 break;
             }
@@ -1321,7 +1521,10 @@ impl TessellatorApp {
                             .range(1..=16)
                             .speed(0.1),
                     );
-                    if r.changed() {
+                    // Trigger a rescan only on commit (lost focus or Enter),
+                    // not while typing - otherwise typing "10" rescans at
+                    // "1" and again at "10".
+                    if r.lost_focus() || r.drag_stopped() {
                         depth_changed = true;
                     }
                 });
@@ -1427,23 +1630,48 @@ impl TessellatorApp {
                         let name_max_w =
                             (child.available_width() - star_w - 4.0).max(0.0);
 
-                        // Filename. Bold when selected; truncated to one line
-                        // with an ellipsis. Tooltip shows the full name on
-                        // hover so a long filename is never lost.
-                        let name_text = if is_selected {
-                            egui::RichText::new(&entry.name)
-                                .strong()
-                                .color(visuals.selection.stroke.color)
+                        // Filename + dimensions, stacked. Bold name on the
+                        // top line (truncated with ellipsis), small dim
+                        // subtitle below showing source resolution. The
+                        // subtitle is suppressed until the thumbnail decode
+                        // populates source_dims so the row doesn't reflow.
+                        let name_color = if is_selected {
+                            visuals.selection.stroke.color
                         } else {
-                            egui::RichText::new(&entry.name)
+                            visuals.text_color()
                         };
-                        let name_resp = child.add_sized(
+                        let dim_color = if is_selected {
+                            visuals.selection.stroke.color.linear_multiply(0.75)
+                        } else {
+                            visuals.weak_text_color()
+                        };
+                        child.allocate_ui_with_layout(
                             egui::vec2(name_max_w, row_inner_h),
-                            egui::Label::new(name_text)
-                                .truncate()
-                                .selectable(false),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.add_space(2.0);
+                                let name_text = egui::RichText::new(&entry.name)
+                                    .strong()
+                                    .color(name_color);
+                                ui.add(
+                                    egui::Label::new(name_text)
+                                        .truncate()
+                                        .selectable(false),
+                                )
+                                .on_hover_text(&entry.name);
+                                if let Some((w, h)) = entry.source_dims {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{} x {}", w, h))
+                                                .small()
+                                                .color(dim_color),
+                                        )
+                                        .truncate()
+                                        .selectable(false),
+                                    );
+                                }
+                            },
                         );
-                        name_resp.on_hover_text(&entry.name);
 
                         // Star button pinned to the right of the row.
                         child.with_layout(
@@ -1515,6 +1743,13 @@ impl TessellatorApp {
                 ui.separator();
                 ui.checkbox(&mut self.flip_h, "Flip H")
                     .on_hover_text("Mirror horizontally to spot composition issues (H)");
+                if ui
+                    .button(format!("Rotate {}", ["0°", "90°", "180°", "270°"][self.manual_rotation as usize]))
+                    .on_hover_text("Rotate clockwise (R) - hold Shift to go counter-clockwise")
+                    .clicked()
+                {
+                    self.manual_rotation = (self.manual_rotation + 1) & 3;
+                }
                 ui.separator();
                 ui.label("Crop:");
                 egui::ComboBox::from_id_salt("crop_ratio")
@@ -1620,6 +1855,23 @@ impl TessellatorApp {
                         .clicked()
                 {
                     self.pin_selected_to_board();
+                }
+                ui.separator();
+                if self.selected_index.is_some() {
+                    if ui
+                        .button("Rename...")
+                        .on_hover_text("Rename the current image (sidecars follow)")
+                        .clicked()
+                    {
+                        self.rename_selected(ctx);
+                    }
+                    if ui
+                        .button("Trash")
+                        .on_hover_text("Send the current image to the OS trash (Cmd+Delete)")
+                        .clicked()
+                    {
+                        self.delete_selected_to_trash(ctx);
+                    }
                 }
             });
         });
@@ -2139,8 +2391,45 @@ impl TessellatorApp {
                 }
             }
 
-            if response.dragged() && !self.annotating {
-                pan += response.drag_delta() / (screen * 0.5);
+            // A/B compare divider drag-on-image: if the press began within
+            // 6 screen-px of the divider line, capture this whole drag for
+            // divider movement instead of pan / annotation. Re-evaluated
+            // only on drag_started; held in `compare_divider_drag` until
+            // drag_stopped so the user doesn't lose the grab while moving
+            // away from the line.
+            if response.drag_started()
+                && self.compare_image.is_some()
+                && !self.flip_h
+                && let Some(press) = ui.input(|i| i.pointer.press_origin())
+                && let Some([img_w, _]) = self.current_image_size
+            {
+                let scale_x = (img_w as f32 * zoom) / screen.x.max(1.0);
+                // Image-UV.x = u maps to clip.x = scale*(2u-1) + pan.x,
+                // then screen.x = center.x + clip.x * (width / 2).
+                let div_clip = scale_x * (2.0 * self.compare_divider - 1.0) + pan.x;
+                let div_screen_x = rect.center().x + div_clip * rect.width() * 0.5;
+                if (press.x - div_screen_x).abs() <= 6.0 {
+                    self.compare_divider_drag = true;
+                }
+            }
+            if response.drag_stopped() {
+                self.compare_divider_drag = false;
+            }
+
+            if response.dragged() {
+                if self.compare_divider_drag
+                    && let Some([img_w, _]) = self.current_image_size
+                    && let Some(mp) = response.interact_pointer_pos()
+                {
+                    // Invert the screen->divider mapping above to derive the
+                    // new compare_divider from the cursor x.
+                    let scale_x = (img_w as f32 * zoom) / screen.x.max(1.0);
+                    let clip_x = (mp.x - rect.center().x) / (rect.width() * 0.5);
+                    let u = ((clip_x - pan.x) / scale_x.max(1e-3) + 1.0) * 0.5;
+                    self.compare_divider = u.clamp(0.0, 1.0);
+                } else if !self.annotating {
+                    pan += response.drag_delta() / (screen * 0.5);
+                }
             }
 
             self.view = ViewState::Manual { zoom, pan };
@@ -2150,11 +2439,22 @@ impl TessellatorApp {
             // partitions UV into per-tile regions and aspect-fits each
             // image inside its tile). In single-image mode we shape the
             // quad to the source image's aspect, so the texture isn't
-            // stretched.
+            // stretched. Manual rotation 90/270 swaps the displayed aspect
+            // (the shader remaps texture UV; the quad's display W/H here
+            // must match what the user sees).
+            let rotated_quarter = self.manual_rotation == 1 || self.manual_rotation == 3;
+            let (display_w, display_h) = if rotated_quarter {
+                (img_h, img_w)
+            } else {
+                (img_w, img_h)
+            };
             let scale_unflipped = if grid_active {
                 egui::vec2(zoom, zoom)
             } else {
-                egui::vec2((img_w * zoom) / screen.x, (img_h * zoom) / screen.y)
+                egui::vec2(
+                    (display_w * zoom) / screen.x,
+                    (display_h * zoom) / screen.y,
+                )
             };
             // Negative scale.x mirrors the displayed quad horizontally. Pass
             // this scale to screen_to_uv too so cursor → image-UV inverts
@@ -2214,8 +2514,10 @@ impl TessellatorApp {
 
             // Eyedropper: sample the pixel under the cursor at the mip the
             // GPU is closest to displaying. Disabled in grid mode (UV no
-            // longer maps 1:1 to a single image).
-            self.cursor_pixel = if response.hovered() && !grid_active {
+            // longer maps 1:1 to a single image) and when manual rotation
+            // is active (the CPU-side UV->pixel mapping doesn't yet apply
+            // the rotation, so the readout would be wrong).
+            self.cursor_pixel = if response.hovered() && !grid_active && self.manual_rotation == 0 {
                 mouse_pos.and_then(|mouse| {
                     sample_pixel_at(
                         mouse,
@@ -2274,7 +2576,7 @@ impl TessellatorApp {
                     0
                 },
                 screen_aspect: screen.x / screen.y.max(1.0),
-                _pad_grid: 0,
+                manual_rotation: self.manual_rotation,
                 tile_image_aspects: {
                     // Tile 0 = current image; 1..=3 = grid extras. Falls back
                     // to 1.0 (square) for slots without a loaded image; this
@@ -2570,6 +2872,9 @@ struct Pressed {
     toggle_pinboard: bool,
     pin_selected: bool,
     delete_pinned: bool,
+    rotate_cw: bool,
+    rotate_ccw: bool,
+    delete_image: bool,
     copy_path: bool,
 }
 
@@ -2615,6 +2920,14 @@ fn read_pressed_keys(ctx: &egui::Context) -> Pressed {
             pin_selected: i.consume_key(Modifiers::NONE, Key::B),
             delete_pinned: i.consume_key(Modifiers::NONE, Key::Delete)
                 || i.consume_key(Modifiers::NONE, Key::Backspace),
+            rotate_cw: i.consume_key(Modifiers::NONE, Key::R),
+            rotate_ccw: i.consume_key(Modifiers::SHIFT, Key::R),
+            // Cmd-Delete (or Cmd-Backspace on Mac) sends the current
+            // image to the OS trash. Plain Delete is reserved for the
+            // pinboard remove-pinned action and would be too easy to
+            // mis-trigger here.
+            delete_image: i.consume_key(Modifiers::COMMAND, Key::Delete)
+                || i.consume_key(Modifiers::COMMAND, Key::Backspace),
             copy_path: !any_focused && i.consume_key(Modifiers::COMMAND, Key::C),
         }
     })

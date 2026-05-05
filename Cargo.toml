@@ -23,3 +23,6 @@ libc = "0.2"
 jpeg-decoder = "0.3"
 kamadak-exif = "0.6"
 wide = "0.7"
+# Cross-platform "send to recycle bin" so delete is recoverable. Avoids the
+# data-loss footgun of a raw fs::remove_file in a photo viewer.
+trash = "5"
