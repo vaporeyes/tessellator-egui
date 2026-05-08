@@ -19,8 +19,12 @@ use crate::io::{self, CancelToken, DecodedImage, ImagePurpose, Message};
 use crate::view::{view_matrix, ViewState};
 use crate::watcher::FolderWatcher;
 
-/// Maximum bytes of decoded image data held in the LRU cache (~512 MB).
-const CACHE_CAP_BYTES: usize = 512 * 1024 * 1024;
+/// Dynamic cache size: 25% of total system RAM, but at least 256MB and at most 8GB.
+fn compute_cache_cap() -> usize {
+    let total = io::get_total_memory();
+    let quarter = total / 4;
+    quarter.clamp(256 * 1024 * 1024, 8192 * 1024 * 1024)
+}
 
 pub struct FileEntry {
     pub path: PathBuf,
@@ -362,7 +366,7 @@ impl TessellatorApp {
             pending_image_requests: HashMap::new(),
             last_select_time: None,
             direction_streak: 0,
-            image_cache: ImageCache::new(CACHE_CAP_BYTES),
+            image_cache: ImageCache::new(compute_cache_cap()),
             high_res_generation: 0,
             last_load_error: None,
             pending_scroll_to_index: None,
@@ -2984,34 +2988,21 @@ fn sample_pixel_at(
     rect: egui::Rect,
     scale: egui::Vec2,
     pan: egui::Vec2,
-    zoom: f32,
+    _zoom: f32,
     image: &DecodedImage,
 ) -> Option<CursorSample> {
     let uv = screen_to_uv(mouse, rect, scale, pan)?;
 
-    // Pick the mip level the GPU is closest to displaying so the readout
-    // matches the on-screen color rather than mip-0 detail invisible at
-    // low zoom. zoom=1 -> mip 0, zoom=0.5 -> mip 1, zoom=0.25 -> mip 2, etc.
-    let lod = if zoom >= 1.0 {
-        0
-    } else {
-        ((-zoom.log2()).floor() as usize).min(image.mips.len().saturating_sub(1))
-    };
-    let mip = image.mips.get(lod)?;
-    let mx = ((uv.x * mip.width as f32) as u32).min(mip.width.saturating_sub(1));
-    let my = ((uv.y * mip.height as f32) as u32).min(mip.height.saturating_sub(1));
-    let idx = (my as usize * mip.width as usize + mx as usize) * 4;
+    let mx = ((uv.x * image.width as f32) as u32).min(image.width.saturating_sub(1));
+    let my = ((uv.y * image.height as f32) as u32).min(image.height.saturating_sub(1));
+    let idx = (my as usize * image.width as usize + mx as usize) * 4;
     let rgba = [
-        *mip.rgba.get(idx)?,
-        *mip.rgba.get(idx + 1)?,
-        *mip.rgba.get(idx + 2)?,
-        *mip.rgba.get(idx + 3)?,
+        *image.rgba.get(idx)?,
+        *image.rgba.get(idx + 1)?,
+        *image.rgba.get(idx + 2)?,
+        *image.rgba.get(idx + 3)?,
     ];
-    // Report the original-image coordinate so the readout doesn't shift as
-    // the user zooms.
-    let x = ((uv.x * image.width as f32) as u32).min(image.width.saturating_sub(1));
-    let y = ((uv.y * image.height as f32) as u32).min(image.height.saturating_sub(1));
-    Some(CursorSample { x, y, rgba })
+    Some(CursorSample { x: mx, y: my, rgba })
 }
 
 #[cfg(test)]

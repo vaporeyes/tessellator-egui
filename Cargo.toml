@@ -26,3 +26,9 @@ wide = "0.7"
 # Cross-platform "send to recycle bin" so delete is recoverable. Avoids the
 # data-loss footgun of a raw fs::remove_file in a photo viewer.
 trash = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }

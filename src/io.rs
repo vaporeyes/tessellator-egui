@@ -5,13 +5,11 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use image::{DynamicImage, ImageDecoder};
 use memmap2::Mmap;
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use wide::u32x8;
 
 /// Cooperative cancellation handle shared between the app (which decides to
 /// cancel) and the rayon worker (which polls at known checkpoints). Cheap to
@@ -80,9 +78,37 @@ fn read_to_vec(file: &mut File, size_hint: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Returns the total physical memory of the system in bytes.
+/// Falls back to a sensible default (8GB) if detection fails.
+pub fn get_total_memory() -> usize {
+    #[cfg(unix)]
+    {
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if pages > 0 && page_size > 0 {
+            return (pages as usize).saturating_mul(page_size as usize);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::mem;
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status: MEMORYSTATUSEX = unsafe { mem::zeroed() };
+        status.dwLength = mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+            return status.ullTotalPhys as usize;
+        }
+    }
+
+    // Default to 8GB if detection fails.
+    8 * 1024 * 1024 * 1024
+}
+
 /// Best-effort detection of network-mounted paths. False negatives mean we
 /// take the SIGBUS risk; false positives mean a slightly slower buffered read.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn is_likely_network_path(path: &Path) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -90,24 +116,84 @@ fn is_likely_network_path(path: &Path) -> bool {
     let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(cpath.as_ptr(), &mut buf) } != 0 {
-        return false;
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(cpath.as_ptr(), &mut buf) } != 0 {
+            return false;
+        }
+        let raw: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                buf.f_fstypename.as_ptr() as *const u8,
+                buf.f_fstypename.len(),
+            )
+        };
+        let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let name = std::str::from_utf8(&raw[..len]).unwrap_or("");
+        matches!(name, "nfs" | "smbfs" | "afpfs" | "webdav" | "ftp")
     }
-    let raw: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            buf.f_fstypename.as_ptr() as *const u8,
-            buf.f_fstypename.len(),
-        )
-    };
-    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-    let name = std::str::from_utf8(&raw[..len]).unwrap_or("");
-    matches!(name, "nfs" | "smbfs" | "afpfs" | "webdav" | "ftp")
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(cpath.as_ptr(), &mut buf) } != 0 {
+            return false;
+        }
+        // Linux statfs uses a magic number for the filesystem type.
+        // Constants from <linux/magic.h>
+        match buf.f_type as u32 {
+            0x6969 => true,      // NFS_SUPER_MAGIC
+            0x517B => true,      // SMB_SUPER_MAGIC
+            0x564C => true,      // NCP_SUPER_MAGIC (NetWare)
+            0xFE534D42 => true,  // SMB2_MAGIC_NUMBER
+            0x9753 => true,      // CIFS_MAGIC_NUMBER
+            0x1173 => true,      // CODA_SUPER_MAGIC
+            _ => false,
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn is_likely_network_path(_path: &Path) -> bool {
-    false
+#[cfg(windows)]
+fn is_likely_network_path(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    let path_str = path.to_string_lossy();
+    // UNC paths (\\server\share) are definitely network paths.
+    if path_str.starts_with("\\\\") {
+        return true;
+    }
+
+    // Check drive type for mapped network drives (Z:\...).
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    // GetDriveTypeW needs a root path like "C:\".
+    // We try to find the root part of the path.
+    if let Some(root) = path.components().next().and_then(|c| match c {
+        std::path::Component::Prefix(p) => Some(p.as_os_str()),
+        _ => None,
+    }) {
+        let mut root_wide: Vec<u16> = root.encode_wide().collect();
+        // Ensure it ends with a backslash.
+        if !root_wide.ends_with(&[b'\\' as u16]) {
+            root_wide.push(b'\\' as u16);
+        }
+        root_wide.push(0);
+
+        unsafe {
+            let drive_type = windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root_wide.as_ptr());
+            drive_type == windows_sys::Win32::Storage::FileSystem::DRIVE_REMOTE
+        }
+    } else {
+        false
+    }
 }
 
 /// Convert a DynamicImage to an RgbaImage, consuming the buffer when the
@@ -187,29 +273,23 @@ fn read_exif_orientation(bytes: &[u8]) -> image::metadata::Orientation {
         .unwrap_or(image::metadata::Orientation::NoTransforms)
 }
 
-/// One level of an RGBA mip chain, ready for direct GPU upload.
-pub struct MipLevel {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
-
-/// A fully prepared image: dimensions plus a complete RGBA mip chain. All
-/// CPU-side work (decode, EXIF rotate, RGBA convert, mip generation,
-/// histogram, palette extraction) is done on the worker thread that produces
+/// A fully prepared image: dimensions plus the base RGBA buffer. All
+/// heavy CPU work (decode, EXIF rotate, RGBA convert, histogram,
+/// palette extraction) is done on the worker thread that produces
 /// this so the render thread only needs to memcpy bytes to the GPU.
+/// Mipmaps are generated on the GPU.
 pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
-    pub mips: Vec<MipLevel>,
+    pub rgba: Vec<u8>,
     pub histogram: Histogram,
     pub palette: Vec<[u8; 3]>,
 }
 
 impl DecodedImage {
-    /// Approximate footprint of the decoded mip chain in bytes.
+    /// Approximate footprint of the decoded image in bytes.
     pub fn byte_size(&self) -> usize {
-        self.mips.iter().map(|m| m.rgba.len()).sum()
+        self.rgba.len()
     }
 }
 
@@ -236,10 +316,15 @@ impl Default for Histogram {
     }
 }
 
-/// Build per-channel + luma histograms from raw RGBA bytes.
-fn compute_histogram(rgba: &[u8]) -> Histogram {
+/// Build per-channel + luma histograms from raw RGBA bytes using strided
+/// sampling for speed on large images.
+fn compute_histogram(rgba: &[u8], width: u32, height: u32) -> Histogram {
     let mut h = Histogram::default();
-    for px in rgba.chunks_exact(4) {
+    // Aim for ~250k samples.
+    let total_pixels = (width as u64) * (height as u64);
+    let stride = (total_pixels / 250_000).max(1) as usize;
+
+    for px in rgba.chunks_exact(4).step_by(stride) {
         h.r[px[0] as usize] += 1;
         h.g[px[1] as usize] += 1;
         h.b[px[2] as usize] += 1;
@@ -257,14 +342,21 @@ fn compute_histogram(rgba: &[u8]) -> Histogram {
 /// Median-cut palette extraction. Splits the color box repeatedly along the
 /// widest channel until `target_count` boxes exist, then averages each box to
 /// produce a palette color. Pixel-frequency-weighted (no dedupe).
-fn extract_palette(rgba: &[u8], target_count: usize) -> Vec<[u8; 3]> {
+/// Uses strided sampling for speed on large images.
+fn extract_palette(rgba: &[u8], width: u32, height: u32, target_count: usize) -> Vec<[u8; 3]> {
     if rgba.len() < 4 || target_count == 0 {
         return Vec::new();
     }
+    // Aim for ~16k samples for palette extraction.
+    let total_pixels = (width as u64) * (height as u64);
+    let stride = (total_pixels / 16_000).max(1) as usize;
+
     let mut pixels: Vec<[u8; 3]> = rgba
         .chunks_exact(4)
+        .step_by(stride)
         .map(|p| [p[0], p[1], p[2]])
         .collect();
+    if pixels.is_empty() { return Vec::new(); }
 
     // Index ranges into `pixels` so we can mutably sort each slice without
     // juggling overlapping borrows.
@@ -373,7 +465,7 @@ impl From<image::ImageError> for DecodeError {
     }
 }
 
-fn decode_image_with_mips(
+fn decode_image_prepared(
     path: &Path,
     cancel: &CancelToken,
 ) -> Result<DecodedImage, DecodeError> {
@@ -386,148 +478,19 @@ fn decode_image_with_mips(
         return Err(DecodeError::Cancelled);
     }
     let (width, height) = rgba.dimensions();
-    let max_dim = width.max(height).max(1);
-    let level_count = max_dim.ilog2() + 1;
 
-    let mut mips = Vec::with_capacity(level_count as usize);
-    mips.push(MipLevel { width, height, rgba: rgba.into_raw() });
-    for _ in 1..level_count {
-        if cancel.is_cancelled() {
-            return Err(DecodeError::Cancelled);
-        }
-        let prev = mips.last().unwrap();
-        mips.push(downsample_box(&prev.rgba, prev.width, prev.height));
-    }
-
-    // Color analysis: histogram from a mip with ~100k+ samples, palette from
-    // a smaller mip (~10k samples is plenty for median cut). Falls back to
-    // the smallest available mip for tiny images.
+    // Color analysis: histogram from strided samples, palette from even
+    // coarser samples.
     if cancel.is_cancelled() {
         return Err(DecodeError::Cancelled);
     }
-    let last_mip = mips.len().saturating_sub(1);
-    let hist_lod = 3.min(last_mip);
-    let pal_lod = 5.min(last_mip);
-    let histogram = compute_histogram(&mips[hist_lod].rgba);
+    let histogram = compute_histogram(rgba.as_raw(), width, height);
     if cancel.is_cancelled() {
         return Err(DecodeError::Cancelled);
     }
-    let palette = extract_palette(&mips[pal_lod].rgba, 8);
+    let palette = extract_palette(rgba.as_raw(), width, height, 8);
 
-    Ok(DecodedImage { width, height, mips, histogram, palette })
-}
-
-/// 2x2 box-filter downsample of an RGBA8 buffer. Odd dimensions clamp to the
-/// last row/column.
-///
-/// Uses SWAR-on-u32 averaging (the `0x00FF00FF` mask trick splits each pixel
-/// into two pairs of channels that sum independently), accelerated to 8
-/// pixels at a time via `wide::u32x8`. For mips at or above 256x256 output,
-/// rows are processed in parallel via rayon. Below that, the rayon dispatch
-/// overhead exceeds the SIMD work, so we run sequentially.
-fn downsample_box(src: &[u8], src_w: u32, src_h: u32) -> MipLevel {
-    let dst_w = (src_w / 2).max(1);
-    let dst_h = (src_h / 2).max(1);
-    let src_stride = (src_w as usize) * 4;
-    let dst_stride = (dst_w as usize) * 4;
-    let mut dst = vec![0u8; (dst_w * dst_h * 4) as usize];
-
-    // Below this output size, rayon dispatch overhead exceeds the work.
-    const PARALLEL_THRESHOLD: u32 = 256 * 256;
-    let parallel = dst_w * dst_h >= PARALLEL_THRESHOLD;
-
-    let row_op = |dst_y: usize, dst_row: &mut [u8]| {
-        let sy0 = dst_y * 2;
-        let sy1 = (sy0 + 1).min((src_h - 1) as usize);
-        // Both source rows are 4-byte aligned because `src` came from a Vec<u8>
-        // (≥ 16-byte alignment) and `src_stride` is a multiple of 4.
-        let top = bytemuck::cast_slice::<u8, u32>(
-            &src[sy0 * src_stride..sy0 * src_stride + src_stride],
-        );
-        let bot = bytemuck::cast_slice::<u8, u32>(
-            &src[sy1 * src_stride..sy1 * src_stride + src_stride],
-        );
-        let dst_row = bytemuck::cast_slice_mut::<u8, u32>(dst_row);
-        downsample_row(top, bot, dst_row, src_w as usize, dst_w as usize);
-    };
-
-    if parallel {
-        dst.par_chunks_mut(dst_stride)
-            .enumerate()
-            .for_each(|(y, row)| row_op(y, row));
-    } else {
-        for (y, row) in dst.chunks_mut(dst_stride).enumerate() {
-            row_op(y, row);
-        }
-    }
-
-    MipLevel { width: dst_w, height: dst_h, rgba: dst }
-}
-
-#[inline]
-fn downsample_row(top: &[u32], bot: &[u32], dst: &mut [u32], src_w: usize, dst_w: usize) {
-    let simd_chunks = dst_w / 8;
-    for chunk in 0..simd_chunks {
-        let x = chunk * 16;
-        // Manual deinterleave: even-indexed input pixels into one vector,
-        // odd-indexed into the other. wide doesn't expose shuffles, so we
-        // build the lanes explicitly. The compiler typically unrolls this
-        // into a few NEON/AVX shuffle ops.
-        let p00 = u32x8::from([
-            top[x],     top[x + 2], top[x + 4], top[x + 6],
-            top[x + 8], top[x + 10], top[x + 12], top[x + 14],
-        ]);
-        let p01 = u32x8::from([
-            top[x + 1], top[x + 3], top[x + 5], top[x + 7],
-            top[x + 9], top[x + 11], top[x + 13], top[x + 15],
-        ]);
-        let p10 = u32x8::from([
-            bot[x],     bot[x + 2], bot[x + 4], bot[x + 6],
-            bot[x + 8], bot[x + 10], bot[x + 12], bot[x + 14],
-        ]);
-        let p11 = u32x8::from([
-            bot[x + 1], bot[x + 3], bot[x + 5], bot[x + 7],
-            bot[x + 9], bot[x + 11], bot[x + 13], bot[x + 15],
-        ]);
-        let avg = avg_4_u32x8(p00, p01, p10, p11);
-        dst[chunk * 8..chunk * 8 + 8].copy_from_slice(&avg.to_array());
-    }
-    // Scalar tail for the remaining 0..7 output pixels.
-    let tail_start = simd_chunks * 8;
-    for (i, slot) in dst[tail_start..dst_w].iter_mut().enumerate() {
-        let x = tail_start + i;
-        let sx0 = x * 2;
-        let sx1 = (sx0 + 1).min(src_w - 1);
-        *slot = avg_4_u32(top[sx0], top[sx1], bot[sx0], bot[sx1]);
-    }
-}
-
-/// Average 8 sets of 4 RGBA pixels in parallel using SWAR + SIMD.
-///
-/// Splitting each u32 with `0x00FF00FF` puts R and B into separate u16 lanes
-/// inside one u32; shifting by 8 then masking does the same for G and A.
-/// 4 channel values sum to ≤ 1020, which fits in 10 bits — no carry into
-/// the adjacent lane.
-#[inline]
-fn avg_4_u32x8(p00: u32x8, p01: u32x8, p10: u32x8, p11: u32x8) -> u32x8 {
-    let mask = u32x8::splat(0x00FF_00FF);
-    let lo = (p00 & mask) + (p01 & mask) + (p10 & mask) + (p11 & mask);
-    let hi = ((p00 >> 8) & mask)
-        + ((p01 >> 8) & mask)
-        + ((p10 >> 8) & mask)
-        + ((p11 >> 8) & mask);
-    ((lo >> 2) & mask) | (((hi >> 2) & mask) << 8)
-}
-
-#[inline]
-fn avg_4_u32(p00: u32, p01: u32, p10: u32, p11: u32) -> u32 {
-    let mask = 0x00FF_00FF_u32;
-    let lo = (p00 & mask) + (p01 & mask) + (p10 & mask) + (p11 & mask);
-    let hi = ((p00 >> 8) & mask)
-        + ((p01 >> 8) & mask)
-        + ((p10 >> 8) & mask)
-        + ((p11 >> 8) & mask);
-    ((lo >> 2) & mask) | (((hi >> 2) & mask) << 8)
+    Ok(DecodedImage { width, height, rgba: rgba.into_raw(), histogram, palette })
 }
 
 /// Why an image was decoded. `Display` results drive the viewport (subject to
@@ -722,7 +685,7 @@ pub fn request_image(
             purpose,
             path.file_name().unwrap_or_default()
         );
-        match decode_image_with_mips(&path, &cancel) {
+        match decode_image_prepared(&path, &cancel) {
             Ok(img) => {
                 let _ = sender.send(Message::ImageDecoded {
                     path,
@@ -754,118 +717,6 @@ pub fn request_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Naive bytewise reference implementation. Sums each channel separately
-    /// and divides by 4 — what `avg_4_u32` and `avg_4_u32x8` must produce.
-    fn ref_avg(p00: u32, p01: u32, p10: u32, p11: u32) -> u32 {
-        let extract = |p: u32| {
-            [
-                (p & 0xFF) as u32,
-                ((p >> 8) & 0xFF) as u32,
-                ((p >> 16) & 0xFF) as u32,
-                ((p >> 24) & 0xFF) as u32,
-            ]
-        };
-        let a = extract(p00);
-        let b = extract(p01);
-        let c = extract(p10);
-        let d = extract(p11);
-        let r = (a[0] + b[0] + c[0] + d[0]) / 4;
-        let g = (a[1] + b[1] + c[1] + d[1]) / 4;
-        let bl = (a[2] + b[2] + c[2] + d[2]) / 4;
-        let al = (a[3] + b[3] + c[3] + d[3]) / 4;
-        r | (g << 8) | (bl << 16) | (al << 24)
-    }
-
-    #[test]
-    fn avg_scalar_matches_reference() {
-        let cases = [
-            (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF),
-            (0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000),
-            (0xABCD_EF12, 0x3456_789A, 0xBCDE_F011, 0x2233_4455),
-            (0xFF00_FF00, 0x00FF_00FF, 0xFFFF_0000, 0x0000_FFFF),
-            (0x8080_8080, 0x8080_8080, 0x8080_8080, 0x8080_8080),
-        ];
-        for (a, b, c, d) in cases {
-            assert_eq!(
-                avg_4_u32(a, b, c, d),
-                ref_avg(a, b, c, d),
-                "inputs: {:08x} {:08x} {:08x} {:08x}",
-                a,
-                b,
-                c,
-                d
-            );
-        }
-    }
-
-    #[test]
-    fn avg_simd_matches_scalar_per_lane() {
-        // Build 8 lanes of varied per-pixel values and verify the SIMD
-        // implementation produces the same result lane-wise.
-        let mut p00 = [0u32; 8];
-        let mut p01 = [0u32; 8];
-        let mut p10 = [0u32; 8];
-        let mut p11 = [0u32; 8];
-        for i in 0..8 {
-            let k = i as u32;
-            p00[i] = (k.wrapping_mul(0x0123_4567)).wrapping_add(0x1111_1111);
-            p01[i] = 0xFFAA_5500 ^ k.wrapping_mul(31);
-            p10[i] = (k.wrapping_mul(0x1020_3040)).wrapping_add(7);
-            p11[i] = u32::MAX.wrapping_sub(k.wrapping_mul(0x1122_3344));
-        }
-        let simd = avg_4_u32x8(
-            u32x8::from(p00),
-            u32x8::from(p01),
-            u32x8::from(p10),
-            u32x8::from(p11),
-        );
-        let lanes = simd.to_array();
-        for i in 0..8 {
-            assert_eq!(
-                lanes[i],
-                avg_4_u32(p00[i], p01[i], p10[i], p11[i]),
-                "lane {}",
-                i
-            );
-        }
-    }
-
-    #[test]
-    fn downsample_box_2x2_red() {
-        let src = vec![
-            255, 0, 0, 255, 255, 0, 0, 255,
-            255, 0, 0, 255, 255, 0, 0, 255,
-        ];
-        let mip = downsample_box(&src, 2, 2);
-        assert_eq!(mip.width, 1);
-        assert_eq!(mip.height, 1);
-        assert_eq!(mip.rgba, vec![255, 0, 0, 255]);
-    }
-
-    #[test]
-    fn downsample_box_averages_correctly() {
-        // R values 0, 100, 200, 200 → avg 125.  Alpha all 255.
-        let src = vec![
-            0, 0, 0, 255, 100, 0, 0, 255,
-            200, 0, 0, 255, 200, 0, 0, 255,
-        ];
-        let mip = downsample_box(&src, 2, 2);
-        assert_eq!(mip.rgba[0], 125, "R channel average");
-        assert_eq!(mip.rgba[3], 255, "alpha preserved");
-    }
-
-    #[test]
-    fn downsample_box_clamps_when_src_height_is_one() {
-        // src_h=1 forces sy1 to clamp to row 0 (= sy0). Both top and bot
-        // resolve to row 0, so each pixel contributes twice.
-        let src = vec![10, 20, 30, 255, 40, 50, 60, 255];
-        let mip = downsample_box(&src, 2, 1);
-        assert_eq!(mip.width, 1);
-        assert_eq!(mip.height, 1);
-        // R: (10 + 40 + 10 + 40) / 4 = 25
-        assert_eq!(mip.rgba[0], 25);
-    }
 
     #[test]
     fn is_jpeg_magic_bytes() {

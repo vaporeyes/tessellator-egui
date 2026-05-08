@@ -7,6 +7,29 @@ use wgpu::util::DeviceExt;
 
 const SHADER_SOURCE: &str = include_str!("../shader.wgsl");
 
+const BLIT_SHADER_SOURCE: &str = "
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) tex_coords: vec2<f32>,
+};
+
+@vertex
+fn vs_blit(@location(0) position: vec2<f32>, @location(1) tex_coords: vec2<f32>) -> VertexOutput {
+    var out: VertexOutput;
+    out.position = vec4<f32>(position, 0.0, 1.0);
+    out.tex_coords = tex_coords;
+    return out;
+}
+
+@group(0) @binding(0) var t_src: texture_2d<f32>;
+@group(0) @binding(1) var s_src: sampler;
+
+@fragment
+fn fs_blit(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(t_src, s_src, in.tex_coords);
+}
+";
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShaderSettings {
@@ -88,6 +111,10 @@ pub struct TessellatorResources {
     sampler: wgpu::Sampler,
     vertex_buffer: wgpu::Buffer,
     settings_buffer: wgpu::Buffer,
+
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
+
     main_texture: Option<wgpu::Texture>,
     compare_texture: Option<wgpu::Texture>,
     annotation_texture: Option<wgpu::Texture>,
@@ -110,6 +137,81 @@ impl TessellatorResources {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tessellator.shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
+        });
+
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tessellator.blit_shader"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER_SOURCE.into()),
+        });
+
+        let blit_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tessellator.blit_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tessellator.blit_pipeline_layout"),
+            bind_group_layouts: &[&blit_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tessellator.blit_pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs_blit"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs_blit"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -314,6 +416,8 @@ impl TessellatorResources {
             grid_c_texture: None,
             grid_d_texture: None,
             bind_group: None,
+            blit_pipeline,
+            blit_bind_group_layout,
         }
     }
 
@@ -323,7 +427,7 @@ impl TessellatorResources {
         queue: &wgpu::Queue,
         image: &DecodedImage,
     ) {
-        self.main_texture = Some(create_image_texture(device, queue, image, "main"));
+        self.main_texture = Some(self.create_image_texture(device, queue, image, "main"));
         self.rebuild_bind_group(device);
     }
 
@@ -334,7 +438,7 @@ impl TessellatorResources {
         image: Option<&DecodedImage>,
     ) {
         self.compare_texture =
-            image.map(|img| create_image_texture(device, queue, img, "compare"));
+            image.map(|img| self.create_image_texture(device, queue, img, "compare"));
         self.rebuild_bind_group(device);
     }
 
@@ -359,7 +463,21 @@ impl TessellatorResources {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        upload_mip(queue, &texture, 0, rgba, width, height);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
         self.annotation_texture = Some(texture);
         self.rebuild_bind_group(device);
     }
@@ -417,7 +535,7 @@ impl TessellatorResources {
             3 => "grid_d",
             _ => return,
         };
-        let texture = image.map(|img| create_image_texture(device, queue, img, label));
+        let texture = image.map(|img| self.create_image_texture(device, queue, img, label));
         match slot {
             1 => self.grid_b_texture = texture,
             2 => self.grid_c_texture = texture,
@@ -518,80 +636,131 @@ impl TessellatorResources {
     pub fn current_bind_group(&self) -> Option<&wgpu::BindGroup> {
         self.bind_group.as_ref()
     }
-}
 
-fn create_image_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    image: &DecodedImage,
-    label_suffix: &str,
-) -> wgpu::Texture {
-    let max_dim = device.limits().max_texture_dimension_2d;
+    fn create_image_texture(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: &DecodedImage,
+        label_suffix: &str,
+    ) -> wgpu::Texture {
+        let width = image.width;
+        let height = image.height;
+        let mip_level_count = (width.max(height).max(1)).ilog2() + 1;
 
-    // Find the first mip whose dimensions fit the device's texture-size cap.
-    // For images larger than that cap (rare on M1+ which support 16384, common
-    // on older GPUs at 8192), we upload from a downscaled mip level instead
-    // of failing. CPU-side mip chain stays full-resolution so the eyedropper
-    // can still sample original pixels.
-    let lod_offset = image
-        .mips
-        .iter()
-        .position(|mip| mip.width <= max_dim && mip.height <= max_dim)
-        .unwrap_or_else(|| image.mips.len() - 1);
-    let upload_mips = &image.mips[lod_offset..];
-    let width = upload_mips[0].width;
-    let height = upload_mips[0].height;
-    let mip_level_count = upload_mips.len() as u32;
-
-    if lod_offset > 0 {
-        log::warn!(
-            "Image {}x{} exceeds device max_texture_dimension_2d={}; uploading from mip {} ({}x{}, {} mips)",
-            image.width, image.height, max_dim, lod_offset, width, height, mip_level_count
-        );
-    } else {
         log::info!(
-            "Uploading {} texture: {}x{} ({} mips)",
-            label_suffix, width, height, mip_level_count
+            "Uploading {} texture: {}x{} ({} mips, GPU generated)",
+            label_suffix,
+            width,
+            height,
+            mip_level_count
         );
-    }
 
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("tessellator.image_texture"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    for (level, mip) in upload_mips.iter().enumerate() {
-        upload_mip(queue, &texture, level as u32, &mip.rgba, mip.width, mip.height);
-    }
-    texture
-}
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tessellator.image_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
 
-fn upload_mip(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    level: u32,
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-) {
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: level,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * width),
-            rows_per_image: None,
-        },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-    );
+        // Upload level 0.
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Generate mips via blit.
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        for level in 1..mip_level_count {
+            let view_src = texture.create_view(&wgpu::TextureViewDescriptor {
+                label: None,
+                format: None,
+                dimension: None,
+                usage: None,
+                aspect: wgpu::TextureAspect::All,
+                base_mip_level: level - 1,
+                mip_level_count: Some(1),
+                base_array_layer: 0,
+                array_layer_count: None,
+            });
+            let view_dst = texture.create_view(&wgpu::TextureViewDescriptor {
+                label: None,
+                format: None,
+                dimension: None,
+                usage: None,
+                aspect: wgpu::TextureAspect::All,
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                base_array_layer: 0,
+                array_layer_count: None,
+            });
+
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.blit_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view_src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view_dst,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rpass.set_pipeline(&self.blit_pipeline);
+                rpass.set_bind_group(0, &bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                rpass.draw(0..6, 0..1);
+            }
+        }
+
+        queue.submit(Some(encoder.finish()));
+
+        texture
+    }
 }
