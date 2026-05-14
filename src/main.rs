@@ -37,6 +37,7 @@ fn main() -> eframe::Result {
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::default(),
+                ..Default::default()
             }
         });
     }

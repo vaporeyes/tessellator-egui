@@ -231,6 +231,9 @@ pub struct TessellatorApp {
     compact: bool,
     /// Sidebar filter: only show starred entries.
     show_only_starred: bool,
+    /// Sidebar text filter. Matched case-insensitively against filename.
+    /// A leading `.` is treated as an extension filter (e.g. `.jpg`).
+    filter_query: String,
 
     /// Multi-image grid compare. Tile 0 is the currently-selected image
     /// (drawn from `current_image`); tiles 1..=3 are user-picked extras.
@@ -264,6 +267,7 @@ pub struct TessellatorApp {
     compare_divider_drag: bool,
 
     show_histogram: bool,
+    show_exif: bool,
     show_color_panel: bool,
     clipping_warning: bool,
     split_tone_amount: f32,
@@ -280,6 +284,11 @@ pub struct TessellatorApp {
     /// Pixel under the cursor in the viewport (image coords + RGBA), updated
     /// each frame. Drives the eyedropper readout in the status bar.
     cursor_pixel: Option<CursorSample>,
+
+    /// Set by the toolbar Export button. Consumed in `ui()` where the wgpu
+    /// frame is in scope. The path is the destination chosen by the user;
+    /// extension determines JPEG vs PNG encoding.
+    pending_export: Option<PathBuf>,
 
     /// Folder filesystem watcher; replaced when the folder changes.
     folder_watcher: Option<FolderWatcher>,
@@ -312,6 +321,8 @@ struct PersistentState {
     recent_folders: Vec<PathBuf>,
     #[serde(default)]
     show_histogram: bool,
+    #[serde(default)]
+    show_exif: bool,
     #[serde(default)]
     clipping_warning: bool,
     #[serde(default)]
@@ -404,6 +415,7 @@ impl TessellatorApp {
             reference_mode: saved.reference_mode.unwrap_or(false),
             compact: saved.compact.unwrap_or(false),
             show_only_starred: saved.show_only_starred.unwrap_or(false),
+            filter_query: String::new(),
             grid_paths: Vec::new(),
             grid_images: Vec::new(),
             grid_dirty: [false; 3],
@@ -413,6 +425,7 @@ impl TessellatorApp {
             compare_divider_drag: false,
             manual_rotation: 0,
             show_histogram: saved.show_histogram,
+            show_exif: saved.show_exif,
             show_color_panel: false,
             clipping_warning: saved.clipping_warning,
             split_tone_amount: saved.split_tone_amount.unwrap_or(0.0),
@@ -423,6 +436,7 @@ impl TessellatorApp {
             pending_zoom_step: None,
             recent_folders: saved.recent_folders,
             cursor_pixel: None,
+            pending_export: None,
             folder_watcher: None,
             folder_refresh_at: None,
             restore_selection: None,
@@ -739,6 +753,123 @@ impl TessellatorApp {
         }
     }
 
+    /// Render the current image with effects baked in (grayscale, dither,
+    /// posterize, split-tone, clipping warning, annotation, manual rotation,
+    /// flip-h) at native source resolution and write to `path` as PNG/JPEG
+    /// based on extension. Skips loupe, compare, grid, overlays, and crop.
+    fn run_export(&mut self, path: &std::path::Path, frame: &mut eframe::Frame) {
+        let Some(image) = self.current_image.clone() else {
+            self.last_load_error = Some("Export: no image loaded".to_string());
+            return;
+        };
+        let Some(render_state) = frame.wgpu_render_state() else {
+            self.last_load_error = Some("Export: no wgpu render state".to_string());
+            return;
+        };
+
+        // Output dimensions follow displayed orientation: 90/270 swap axes.
+        let rotated_quarter = self.manual_rotation == 1 || self.manual_rotation == 3;
+        let (out_w, out_h) = if rotated_quarter {
+            (image.height, image.width)
+        } else {
+            (image.width, image.height)
+        };
+
+        // Build identity view (fills the NDC quad), with flip_h folded in.
+        let scale = egui::vec2(if self.flip_h { -1.0 } else { 1.0 }, 1.0);
+        let view = crate::view::view_matrix(scale, egui::vec2(0.0, 0.0));
+
+        let settings = crate::gpu::ShaderSettings {
+            view_matrix: view,
+            grayscale: self.grayscale,
+            // Composition overlays are intentionally excluded from export.
+            overlay_opacity: 0.0,
+            grid_size: self.grid_size,
+            overlay_mode: 0,
+            compare_divider: 0.5,
+            compare_active: 0,
+            loupe_active: 0,
+            loupe_zoom: 1.0,
+            loupe_center_uv: [0.5, 0.5],
+            loupe_center_screen: [0.0, 0.0],
+            loupe_radius: 0.0,
+            dither: u32::from(self.dither),
+            split_tone_active: u32::from(
+                self.shadow_tint != [0.5; 3] || self.highlight_tint != [0.5; 3],
+            ),
+            split_tone_amount: self.split_tone_amount,
+            clipping_warning: u32::from(self.clipping_warning),
+            posterize_active: u32::from(self.value_study),
+            posterize_levels: self.value_levels,
+            annotation_active: u32::from(self.annotation.is_some()),
+            grid_active: 0,
+            grid_count: 0,
+            screen_aspect: out_w as f32 / out_h.max(1) as f32,
+            manual_rotation: self.manual_rotation,
+            tile_image_aspects: [image.width as f32 / image.height.max(1) as f32, 0.0, 0.0, 0.0],
+            shadow_tint: [self.shadow_tint[0], self.shadow_tint[1], self.shadow_tint[2], 0.0],
+            highlight_tint: [
+                self.highlight_tint[0],
+                self.highlight_tint[1],
+                self.highlight_tint[2],
+                0.0,
+            ],
+        };
+
+        let device = &render_state.device;
+        let queue = &render_state.queue;
+        let renderer = render_state.renderer.read();
+        let Some(tess) = renderer
+            .callback_resources
+            .get::<crate::gpu::TessellatorResources>()
+        else {
+            self.last_load_error =
+                Some("Export: render resources not initialised yet".to_string());
+            return;
+        };
+
+        let rgba = match tess.render_to_rgba8(device, queue, out_w, out_h, settings) {
+            Ok(v) => v,
+            Err(e) => {
+                self.last_load_error = Some(format!("Export GPU readback failed: {}", e));
+                return;
+            }
+        };
+        // Drop the renderer read lock before doing disk I/O so the next paint
+        // isn't blocked on file write.
+        drop(renderer);
+
+        let img = match image::RgbaImage::from_raw(out_w, out_h, rgba) {
+            Some(b) => b,
+            None => {
+                self.last_load_error = Some("Export: buffer size mismatch".to_string());
+                return;
+            }
+        };
+
+        // Extension drives encoder choice. JPEG strips alpha (the source is
+        // opaque after rendering, so this is lossless except for chroma).
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let result = match ext.as_str() {
+            "jpg" | "jpeg" => {
+                let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+                rgb.save_with_format(path, image::ImageFormat::Jpeg)
+            }
+            _ => img.save_with_format(path, image::ImageFormat::Png),
+        };
+
+        match result {
+            Ok(()) => log::info!("Exported {} ({}x{})", path.display(), out_w, out_h),
+            Err(e) => {
+                self.last_load_error = Some(format!("Export write failed: {}", e));
+            }
+        }
+    }
+
     /// Rename the currently-selected image. We piggyback on rfd's native
     /// save dialog (which shows a filename field) since rfd has no plain
     /// "text input" dialog. The dialog's parent is forced to the image's
@@ -871,16 +1002,26 @@ impl TessellatorApp {
     /// Indices into `self.files` that pass the active filter. When the
     /// filter is off this is just `0..files.len()`.
     fn visible_indices(&self) -> Vec<usize> {
-        if self.show_only_starred {
-            self.files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| f.starred)
-                .map(|(i, _)| i)
-                .collect()
-        } else {
-            (0..self.files.len()).collect()
-        }
+        let query = self.filter_query.trim().to_lowercase();
+        let ext_filter = query.strip_prefix('.').map(|s| s.to_string());
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                if self.show_only_starred && !f.starred {
+                    return false;
+                }
+                if !query.is_empty() {
+                    let name_lc = f.name.to_lowercase();
+                    return match &ext_filter {
+                        Some(ext) => name_lc.ends_with(&format!(".{}", ext)),
+                        None => name_lc.contains(&query),
+                    };
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Drop the in-memory annotation layer and delete its sidecar PNG from
@@ -1426,26 +1567,30 @@ impl TessellatorApp {
 }
 
 impl eframe::App for TessellatorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_messages(ctx);
-        self.process_folder_refresh(ctx);
-        self.handle_dropped_files(ctx);
-        self.handle_keyboard_nav(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if let Some(path) = self.pending_export.take() {
+            self.run_export(&path, frame);
+        }
+        self.drain_messages(ui.ctx());
+        self.process_folder_refresh(ui.ctx());
+        self.handle_dropped_files(ui.ctx());
+        self.handle_keyboard_nav(ui.ctx());
         // Compact mode strips chrome down to just the viewport, for a clean
         // floating reference. Reference mode (`T`) controls always-on-top
         // and OS decorations independently.
         if !self.compact {
-            self.show_sidebar(ctx);
-            self.show_tools_panel(ctx);
-            self.show_status_bar(ctx);
+            self.show_sidebar(ui);
+            self.show_tools_panel(ui);
+            self.show_status_bar(ui);
         }
         if self.pinboard_mode {
-            self.show_pinboard(ctx);
+            self.show_pinboard(ui);
         } else {
-            self.show_viewport(ctx);
+            self.show_viewport(ui);
         }
-        self.show_color_window(ctx);
-        self.show_drop_overlay(ctx);
+        self.show_color_window(ui.ctx());
+        self.show_exif_window(ui.ctx());
+        self.show_drop_overlay(ui.ctx());
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1462,6 +1607,7 @@ impl eframe::App for TessellatorApp {
             dither: Some(self.dither),
             recent_folders: self.recent_folders.clone(),
             show_histogram: self.show_histogram,
+            show_exif: self.show_exif,
             clipping_warning: self.clipping_warning,
             split_tone_amount: Some(self.split_tone_amount),
             shadow_tint: Some(self.shadow_tint),
@@ -1481,17 +1627,17 @@ impl eframe::App for TessellatorApp {
 }
 
 impl TessellatorApp {
-    fn show_sidebar(&mut self, ctx: &egui::Context) {
+    fn show_sidebar(&mut self, ui: &mut egui::Ui) {
         let mut clicked: Option<usize> = None;
         let mut to_request: Vec<PathBuf> = Vec::new();
         let mut open_folder: Option<PathBuf> = None;
         let mut depth_changed = false;
         let pending_scroll = self.pending_scroll_to_index.take();
 
-        egui::SidePanel::left("sidebar")
+        egui::Panel::left("sidebar")
             .resizable(true)
-            .default_width(250.0)
-            .show(ctx, |ui| {
+            .default_size(250.0)
+            .show_inside(ui, |ui| {
                 ui.heading("Tessellator");
                 ui.horizontal(|ui| {
                     let btn = ui
@@ -1514,7 +1660,7 @@ impl TessellatorApp {
                                     .on_hover_text(path.display().to_string());
                                 if resp.clicked() {
                                     open_folder = Some(path);
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
@@ -1538,6 +1684,23 @@ impl TessellatorApp {
                         .on_hover_text("Filter to favourites (Shift+S)");
                     ui.label(format!("({}/{})", starred_count, self.files.len()));
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Search:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.filter_query)
+                            .hint_text("name or .ext")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if resp.changed() {
+                        // The visible-row count is about to change; the
+                        // current selection's row position will shift, so
+                        // request a scroll to keep it visible if it's still
+                        // in the filtered set.
+                        if let Some(i) = self.selected_index {
+                            self.pending_scroll_to_index = Some(i);
+                        }
+                    }
+                });
                 ui.separator();
 
                 // Row layout: 44px tall, 4px outer gap. Big enough for a
@@ -1551,12 +1714,10 @@ impl TessellatorApp {
                 // the filter is off this is the identity. Centralising it
                 // makes scrolling, click translation, and thumbnail requests
                 // all agree on what a row is.
-                let mut visible: Vec<usize> = Vec::with_capacity(self.files.len());
-                for (i, f) in self.files.iter().enumerate() {
-                    if !self.show_only_starred || f.starred {
-                        visible.push(i);
-                    }
-                }
+                // Leading `.` switches to suffix-match mode (extension search),
+                // anything else is a case-insensitive substring match. See
+                // `visible_indices` for the canonical implementation.
+                let visible: Vec<usize> = self.visible_indices();
 
                 let mut star_toggle: Option<usize> = None;
                 let mut scroll = egui::ScrollArea::vertical();
@@ -1717,24 +1878,24 @@ impl TessellatorApp {
             });
 
         if let Some(path) = open_folder {
-            self.open_folder(path, ctx);
+            self.open_folder(path, ui.ctx());
         } else if depth_changed && let Some(path) = self.folder_path.clone() {
             // Re-scan with the new depth.
-            self.open_folder(path, ctx);
+            self.open_folder(path, ui.ctx());
         }
 
         for path in to_request {
             self.requested_thumbnails.insert(path.clone());
-            io::request_thumbnail(path, self.sender.clone(), ctx.clone());
+            io::request_thumbnail(path, self.sender.clone(), ui.ctx().clone());
         }
 
         if let Some(i) = clicked {
-            self.select_image(i, ctx);
+            self.select_image(i, ui.ctx());
         }
     }
 
-    fn show_tools_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("tools").show(ctx, |ui| {
+    fn show_tools_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("tools").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Grayscale:");
                 ui.add(egui::Slider::new(&mut self.grayscale, 0.0..=1.0));
@@ -1820,15 +1981,17 @@ impl TessellatorApp {
                     self.view = ViewState::one_to_one();
                 }
                 ui.separator();
-                self.show_compare_controls(ui, ctx);
+                self.show_compare_controls(ui);
                 ui.separator();
-                self.show_grid_controls(ui, ctx);
+                self.show_grid_controls(ui);
                 ui.separator();
                 ui.checkbox(&mut self.dither, "Dither")
                     .on_hover_text("Add 1-bit noise to remove gradient banding");
                 ui.separator();
                 ui.checkbox(&mut self.show_histogram, "Histogram")
                     .on_hover_text("RGB + luminance histogram overlay");
+                ui.checkbox(&mut self.show_exif, "EXIF")
+                    .on_hover_text("Camera, lens, and capture settings panel");
                 ui.checkbox(&mut self.clipping_warning, "Clip")
                     .on_hover_text(
                         "Highlight clipped pixels - magenta = blown highlights, cyan = crushed shadows",
@@ -1845,7 +2008,7 @@ impl TessellatorApp {
                 ui.toggle_value(&mut self.reference_mode, "On top")
                     .on_hover_text("Always-on-top + borderless (T)");
                 if self.reference_mode != prev_ref {
-                    self.apply_reference_mode(ctx);
+                    self.apply_reference_mode(ui.ctx());
                 }
                 ui.toggle_value(&mut self.compact, "Compact")
                     .on_hover_text("Hide all panels - just the image (\\)");
@@ -1867,14 +2030,37 @@ impl TessellatorApp {
                         .on_hover_text("Rename the current image (sidecars follow)")
                         .clicked()
                     {
-                        self.rename_selected(ctx);
+                        self.rename_selected(ui.ctx());
                     }
                     if ui
                         .button("Trash")
                         .on_hover_text("Send the current image to the OS trash (Cmd+Delete)")
                         .clicked()
                     {
-                        self.delete_selected_to_trash(ctx);
+                        self.delete_selected_to_trash(ui.ctx());
+                    }
+                    if self.current_image.is_some()
+                        && ui
+                            .button("Export...")
+                            .on_hover_text(
+                                "Render the image with current effects to a new JPEG/PNG",
+                            )
+                            .clicked()
+                    {
+                        let default_name = self
+                            .current_image_path
+                            .as_ref()
+                            .and_then(|p| p.file_stem())
+                            .map(|s| format!("{}_export.png", s.to_string_lossy()))
+                            .unwrap_or_else(|| "export.png".to_string());
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("PNG", &["png"])
+                            .add_filter("JPEG", &["jpg", "jpeg"])
+                            .set_file_name(default_name)
+                            .save_file()
+                        {
+                            self.pending_export = Some(path);
+                        }
                     }
                 }
             });
@@ -1943,7 +2129,7 @@ impl TessellatorApp {
         self.show_color_panel = open;
     }
 
-    fn show_grid_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_grid_controls(&mut self, ui: &mut egui::Ui) {
         if self.grid_paths.is_empty() {
             if ui
                 .button("Grid...")
@@ -1959,7 +2145,7 @@ impl TessellatorApp {
                 // 2-image grid by using the picked file as tile 1.
                 let extras: Vec<PathBuf> = paths.into_iter().take(3).collect();
                 if !extras.is_empty() {
-                    self.start_grid(extras, ctx);
+                    self.start_grid(extras, ui.ctx());
                 }
             }
         } else {
@@ -1972,7 +2158,7 @@ impl TessellatorApp {
         }
     }
 
-    fn show_compare_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_compare_controls(&mut self, ui: &mut egui::Ui) {
         match self.compare_path.clone() {
             None => {
                 if ui
@@ -1983,7 +2169,7 @@ impl TessellatorApp {
                         .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
                         .pick_file()
                 {
-                    self.start_compare(path, ctx);
+                    self.start_compare(path, ui.ctx());
                 }
             }
             Some(p) => {
@@ -2001,8 +2187,8 @@ impl TessellatorApp {
         }
     }
 
-    fn show_status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+    fn show_status_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 let entry = self.selected_index.and_then(|i| self.files.get(i));
                 match entry {
@@ -2039,7 +2225,7 @@ impl TessellatorApp {
                 }
                 if let Some(folder) = &self.folder_path {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(folder.to_string_lossy());
+                        ui.add(egui::Label::new(folder.to_string_lossy()).truncate());
                     });
                 }
             });
@@ -2051,7 +2237,7 @@ impl TessellatorApp {
         if !hovering {
             return;
         }
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("drop_overlay"),
@@ -2066,7 +2252,7 @@ impl TessellatorApp {
         );
     }
 
-    fn show_pinboard(&mut self, ctx: &egui::Context) {
+    fn show_pinboard(&mut self, ui: &mut egui::Ui) {
         // A lookup from path -> thumbnail texture so we can render any
         // pinned item even if the user has scrolled the sidebar past it.
         // (The sidebar only requests thumbs for visible rows, so a pin made
@@ -2074,7 +2260,7 @@ impl TessellatorApp {
         let mut to_request: Vec<PathBuf> = Vec::new();
         let pinboard_id = egui::Id::new("pinboard_canvas");
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             let rect = ui.max_rect();
             // Soft fill so the moodboard plane is visually distinct from
             // the single-image viewport.
@@ -2297,13 +2483,13 @@ impl TessellatorApp {
         for path in to_request {
             if !self.requested_thumbnails.contains(&path) {
                 self.requested_thumbnails.insert(path.clone());
-                io::request_thumbnail(path, self.sender.clone(), ctx.clone());
+                io::request_thumbnail(path, self.sender.clone(), ui.ctx().clone());
             }
         }
     }
 
-    fn show_viewport(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn show_viewport(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some(err) = &self.last_load_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
             }
@@ -2343,7 +2529,7 @@ impl TessellatorApp {
                 // the decode worker runs. Without this we'd repaint only on
                 // user input and the spinner would freeze.
                 if waiting {
-                    ctx.request_repaint();
+                    ui.ctx().request_repaint();
                 }
                 return;
             }
@@ -2538,7 +2724,7 @@ impl TessellatorApp {
 
             // Loupe: active when Alt is held and the cursor is over the image.
             // Disabled in grid mode for the same reason as the eyedropper.
-            let alt_held = ctx.input(|i| i.modifiers.alt);
+            let alt_held = ui.input(|i| i.modifiers.alt);
             let (loupe_active, loupe_center_screen, loupe_center_uv) = if alt_held
                 && response.hovered()
                 && !grid_active
@@ -2703,7 +2889,74 @@ impl TessellatorApp {
             {
                 draw_histogram_overlay(ui, &image.histogram, rect);
             }
+
         });
+    }
+
+    /// Free-floating, draggable EXIF panel. Backed by `egui::Window` so the
+    /// user can move it out of the way of the image. Shown when the toolbar
+    /// "EXIF" toggle is on and the current image's metadata is available.
+    fn show_exif_window(&mut self, ctx: &egui::Context) {
+        if !self.show_exif {
+            return;
+        }
+        let Some(image) = self.current_image.clone() else {
+            return;
+        };
+        let exif = &image.exif;
+
+        let mut open = self.show_exif;
+        egui::Window::new("EXIF")
+            .open(&mut open)
+            .default_width(320.0)
+            .default_pos(egui::pos2(40.0, 80.0))
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                let row = |ui: &mut egui::Ui, label: &str, value: &str| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            egui::vec2(70.0, 0.0),
+                            egui::Label::new(
+                                egui::RichText::new(label).color(egui::Color32::GRAY),
+                            ),
+                        );
+                        ui.add(egui::Label::new(value).truncate());
+                    });
+                };
+
+                row(ui, "Size", &format!("{} x {}", image.width, image.height));
+                if let Some(s) = &exif.camera {
+                    row(ui, "Camera", s);
+                }
+                if let Some(s) = &exif.lens {
+                    row(ui, "Lens", s);
+                }
+                if let Some(s) = &exif.focal_length {
+                    row(ui, "Focal", s);
+                }
+                if let Some(s) = &exif.focal_length_35mm {
+                    row(ui, "", s);
+                }
+                if let Some(s) = &exif.aperture {
+                    row(ui, "Aperture", s);
+                }
+                if let Some(s) = &exif.shutter {
+                    row(ui, "Shutter", s);
+                }
+                if let Some(s) = &exif.iso {
+                    row(ui, "ISO", s);
+                }
+                if let Some(s) = &exif.date_taken {
+                    row(ui, "Taken", s);
+                }
+                if exif.is_empty() {
+                    ui.weak("(no EXIF data)");
+                }
+            });
+        // Window's close button updates `open`; mirror it back so the toolbar
+        // toggle stays in sync.
+        self.show_exif = open;
     }
 }
 

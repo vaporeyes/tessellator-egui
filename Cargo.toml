@@ -4,10 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = { version = "0.31.0", features = ["wgpu", "persistence"] }
-egui = "0.31.0"
-egui-wgpu = "0.31.0"
-wgpu = "24.0.1"
+eframe = { version = "=0.34.1", features = ["wgpu", "persistence"] }
+egui = "=0.34.1"
+egui-wgpu = "=0.34.1"
 image = "0.25.5"
 walkdir = "2.5.0"
 rfd = "0.15.2"
@@ -32,3 +31,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
 ] }
+
+# Local fork of egui-wgpu 0.34.1 that patches the macOS startup-race panic
+# "Surface is not configured for presentation". On macOS, winit briefly
+# reports the new window's inner_size as 0xN, which causes configure_surface
+# to be skipped; the next frame then panics. The patch (vendor/egui-wgpu)
+# defers configuration until a real size arrives. Drop this once upstream
+# eframe ships a fix (likely 0.35+).
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }

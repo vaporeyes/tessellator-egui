@@ -273,6 +273,115 @@ fn read_exif_orientation(bytes: &[u8]) -> image::metadata::Orientation {
         .unwrap_or(image::metadata::Orientation::NoTransforms)
 }
 
+/// Human-readable EXIF metadata fields surfaced in the UI panel. All
+/// strings are pre-formatted on the worker so the render thread just
+/// shows them. `None` for any field means the file didn't carry that tag.
+#[derive(Default, Clone, Debug)]
+pub struct ExifMetadata {
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub iso: Option<String>,
+    pub aperture: Option<String>,
+    pub shutter: Option<String>,
+    pub focal_length: Option<String>,
+    pub focal_length_35mm: Option<String>,
+    pub date_taken: Option<String>,
+}
+
+impl ExifMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.camera.is_none()
+            && self.lens.is_none()
+            && self.iso.is_none()
+            && self.aperture.is_none()
+            && self.shutter.is_none()
+            && self.focal_length.is_none()
+            && self.focal_length_35mm.is_none()
+            && self.date_taken.is_none()
+    }
+}
+
+/// Parse the subset of EXIF tags we display. Returns an empty struct for
+/// containers without EXIF (PNG without chunks, etc).
+fn read_exif_metadata(bytes: &[u8]) -> ExifMetadata {
+    use exif::{In, Reader, Tag, Value};
+
+    let reader = Reader::new();
+    let Ok(data) = reader.read_from_container(&mut Cursor::new(bytes)) else {
+        return ExifMetadata::default();
+    };
+
+    let display = |tag: Tag| -> Option<String> {
+        let f = data.get_field(tag, In::PRIMARY)?;
+        let s = f.display_value().with_unit(&data).to_string();
+        let s = s.trim().trim_matches('"').to_string();
+        if s.is_empty() { None } else { Some(s) }
+    };
+
+    let rational_as_string = |tag: Tag| -> Option<String> {
+        let f = data.get_field(tag, In::PRIMARY)?;
+        match &f.value {
+            Value::Rational(v) if !v.is_empty() => {
+                let r = v[0];
+                if r.denom == 0 {
+                    return None;
+                }
+                Some(format!("{}", r.to_f64()))
+            }
+            _ => None,
+        }
+    };
+
+    let shutter = data.get_field(Tag::ExposureTime, In::PRIMARY).and_then(|f| {
+        if let Value::Rational(v) = &f.value
+            && let Some(r) = v.first()
+            && r.denom != 0
+        {
+            return Some(if r.num == 0 {
+                "0 s".to_string()
+            } else if r.num >= r.denom {
+                format!("{:.1} s", r.to_f64())
+            } else {
+                format!("1/{} s", (r.denom as f64 / r.num as f64).round() as u64)
+            });
+        }
+        None
+    });
+
+    let aperture = rational_as_string(Tag::FNumber).map(|s| format!("f/{}", s));
+    let focal_length = rational_as_string(Tag::FocalLength).map(|s| format!("{} mm", s));
+    let focal_length_35mm =
+        display(Tag::FocalLengthIn35mmFilm).map(|s| format!("{} mm (35mm eq)", s));
+
+    let date_taken =
+        display(Tag::DateTimeOriginal).or_else(|| display(Tag::DateTime));
+
+    let make = display(Tag::Make);
+    let model = display(Tag::Model);
+    let camera = match (make, model) {
+        (Some(make), Some(model)) => {
+            if model.starts_with(&make) {
+                Some(model)
+            } else {
+                Some(format!("{} {}", make, model))
+            }
+        }
+        (Some(s), None) | (None, Some(s)) => Some(s),
+        (None, None) => None,
+    };
+
+    ExifMetadata {
+        camera,
+        lens: display(Tag::LensModel),
+        iso: display(Tag::PhotographicSensitivity),
+        aperture,
+        shutter,
+        focal_length,
+        focal_length_35mm,
+        date_taken,
+    }
+}
+
 /// A fully prepared image: dimensions plus the base RGBA buffer. All
 /// heavy CPU work (decode, EXIF rotate, RGBA convert, histogram,
 /// palette extraction) is done on the worker thread that produces
@@ -284,6 +393,7 @@ pub struct DecodedImage {
     pub rgba: Vec<u8>,
     pub histogram: Histogram,
     pub palette: Vec<[u8; 3]>,
+    pub exif: ExifMetadata,
 }
 
 impl DecodedImage {
@@ -432,9 +542,8 @@ fn average_color(pixels: &[[u8; 3]]) -> [u8; 3] {
 ///
 /// File contents are loaded via memory-mapped I/O when possible, avoiding the
 /// page-cache → user-space copy that the standard `BufReader` path triggers.
-fn decode_image(path: &Path) -> image::ImageResult<DynamicImage> {
-    let bytes = read_file_bytes(path).map_err(image::ImageError::IoError)?;
-    let cursor = Cursor::new(bytes.as_slice());
+fn decode_image_from_bytes(slice: &[u8]) -> image::ImageResult<DynamicImage> {
+    let cursor = Cursor::new(slice);
     let reader = image::ImageReader::new(cursor)
         .with_guessed_format()
         .map_err(image::ImageError::IoError)?;
@@ -443,8 +552,6 @@ fn decode_image(path: &Path) -> image::ImageResult<DynamicImage> {
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder)?;
-    // `bytes` must outlive the decoder; explicit drop here documents that.
-    drop(bytes);
     img.apply_orientation(orientation);
     Ok(img)
 }
@@ -469,7 +576,15 @@ fn decode_image_prepared(
     path: &Path,
     cancel: &CancelToken,
 ) -> Result<DecodedImage, DecodeError> {
-    let img = decode_image(path)?;
+    let bytes = read_file_bytes(path).map_err(|e| {
+        DecodeError::Image(image::ImageError::IoError(e))
+    })?;
+    let exif = read_exif_metadata(bytes.as_slice());
+    if cancel.is_cancelled() {
+        return Err(DecodeError::Cancelled);
+    }
+    let img = decode_image_from_bytes(bytes.as_slice())?;
+    drop(bytes);
     if cancel.is_cancelled() {
         return Err(DecodeError::Cancelled);
     }
@@ -490,7 +605,14 @@ fn decode_image_prepared(
     }
     let palette = extract_palette(rgba.as_raw(), width, height, 8);
 
-    Ok(DecodedImage { width, height, rgba: rgba.into_raw(), histogram, palette })
+    Ok(DecodedImage {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+        histogram,
+        palette,
+        exif,
+    })
 }
 
 /// Why an image was decoded. `Display` results drive the viewport (subject to

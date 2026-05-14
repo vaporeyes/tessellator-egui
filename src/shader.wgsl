@@ -188,7 +188,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let ov = in.tex_coords;
         switch settings.overlay_mode {
             case 1u: {
-                let g = step(vec2<f32>(0.98), fract(ov * settings.grid_size));
+                // Scale U by image aspect so cells are square in image space
+                // rather than square in UV (which would stretch with aspect).
+                let aspect = settings.tile_image_aspects[0];
+                let scaled = vec2<f32>(ov.x * aspect, ov.y) * settings.grid_size;
+                let g = step(vec2<f32>(0.98), fract(scaled));
                 overlay = max(g.x, g.y);
             }
             case 2u: {

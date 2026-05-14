@@ -5,7 +5,15 @@
       "Bash(cargo clippy *)",
       "Bash(cargo test *)",
       "Bash(cargo check *)",
-      "Bash(cargo doc *)"
+      "Bash(cargo doc *)",
+      "Bash(timeout 15 cargo run --release)",
+      "Bash(git -C /Users/jsh/dev/projects/tessellator-egui diff --stat HEAD)",
+      "Bash(git -C /Users/jsh/dev/projects/tessellator-egui log --oneline -5)",
+      "Bash(timeout 5 cargo run --release)",
+      "Bash(cargo search *)",
+      "Read(//Users/jsh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/**)",
+      "Bash(RUST_BACKTRACE=full timeout 5 /Users/jsh/dev/projects/tessellator-egui/target/release/tessellator-egui)",
+      "Bash(cargo tree *)"
     ]
   }
 }
