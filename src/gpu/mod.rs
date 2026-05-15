@@ -5,4 +5,4 @@ mod callback;
 mod resources;
 
 pub use callback::{AnnotationUpload, CompareUpload, GridUpload, TessellatorCallback};
-pub use resources::{ShaderSettings, TessellatorResources};
+pub use resources::{ShaderSettings, TessellatorResources, render_export_resources_to_rgba8};

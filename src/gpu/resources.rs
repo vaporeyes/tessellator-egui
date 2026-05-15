@@ -133,6 +133,14 @@ pub struct TessellatorResources {
     bind_group: Option<wgpu::BindGroup>,
 }
 
+#[derive(Clone)]
+pub struct ExportResources {
+    export_pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    settings_buffer: wgpu::Buffer,
+}
+
 impl TessellatorResources {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         log::debug!("Creating TessellatorResources with format {:?}", format);
@@ -350,8 +358,10 @@ impl TessellatorResources {
             })
         };
         let pipeline = make_pipeline("tessellator.pipeline", format);
-        let export_pipeline =
-            make_pipeline("tessellator.export_pipeline", wgpu::TextureFormat::Rgba8Unorm);
+        let export_pipeline = make_pipeline(
+            "tessellator.export_pipeline",
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -364,12 +374,8 @@ impl TessellatorResources {
         });
 
         let vertices: [f32; 24] = [
-            -1.0,  1.0,  0.0, 0.0,
-            -1.0, -1.0,  0.0, 1.0,
-             1.0,  1.0,  1.0, 0.0,
-             1.0,  1.0,  1.0, 0.0,
-            -1.0, -1.0,  0.0, 1.0,
-             1.0, -1.0,  1.0, 1.0,
+            -1.0, 1.0, 0.0, 0.0, -1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+            -1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0,
         ];
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tessellator.vertex_buffer"),
@@ -386,7 +392,11 @@ impl TessellatorResources {
 
         let annotation_placeholder = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tessellator.annotation_placeholder"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -409,7 +419,11 @@ impl TessellatorResources {
                 bytes_per_row: Some(4),
                 rows_per_image: None,
             },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
 
         Self {
@@ -466,7 +480,11 @@ impl TessellatorResources {
     ) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tessellator.annotation_texture"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -487,7 +505,11 @@ impl TessellatorResources {
                 bytes_per_row: Some(4 * width),
                 rows_per_image: None,
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         self.annotation_texture = Some(texture);
         self.rebuild_bind_group(device);
@@ -521,7 +543,11 @@ impl TessellatorResources {
                 bytes_per_row: Some(4 * width),
                 rows_per_image: None,
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -636,132 +662,13 @@ impl TessellatorResources {
         queue.write_buffer(&self.settings_buffer, 0, bytemuck::cast_slice(&[settings]));
     }
 
-    /// Render the current scene (main_texture + annotation + provided settings)
-    /// to an Rgba8Unorm texture at `width x height`, then read the pixels back
-    /// into a tightly-packed RGBA8 buffer suitable for `image::RgbaImage`.
-    ///
-    /// `settings` should be configured for export (no view transform, no
-    /// loupe/compare/grid; effects like grayscale/posterize/dither/annotation
-    /// are honoured because they're shader-side). The caller is responsible
-    /// for picking the right values - this method just runs one pass.
-    ///
-    /// Returns Err if the bind group is missing (no image loaded), or if
-    /// readback fails. Blocking call: polls the device until the readback
-    /// buffer is mapped.
-    pub fn render_to_rgba8(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        width: u32,
-        height: u32,
-        settings: ShaderSettings,
-    ) -> Result<Vec<u8>, &'static str> {
-        let Some(bind_group) = &self.bind_group else {
-            return Err("no main texture bound");
-        };
-
-        // wgpu requires bytes_per_row in copy_texture_to_buffer to be a
-        // multiple of COPY_BYTES_PER_ROW_ALIGNMENT (256). Allocate padded
-        // rows; we'll trim back to packed RGBA after readback.
-        let unpadded = 4 * width;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded = unpadded.div_ceil(align) * align;
-        let buffer_size = (padded as u64) * (height as u64);
-
-        let color_target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("tessellator.export_target"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let color_view = color_target.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tessellator.export_readback"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        // Push the export-tuned settings without disturbing the live ones.
-        // Settings are restored by the next regular `update_settings` call
-        // from the render thread; that's acceptable because export is a
-        // synchronous user-initiated operation.
-        queue.write_buffer(&self.settings_buffer, 0, bytemuck::cast_slice(&[settings]));
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("tessellator.export_encoder"),
-        });
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tessellator.export_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.set_pipeline(&self.export_pipeline);
-            rpass.set_bind_group(0, bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            rpass.draw(0..6, 0..1);
-        }
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &color_target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        queue.submit(Some(encoder.finish()));
-
-        // Map and block until the GPU is done.
-        let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|_| "device.poll failed")?;
-        rx.recv()
-            .map_err(|_| "map_async result channel dropped")?
-            .map_err(|_| "buffer map failed")?;
-
-        let data = slice.get_mapped_range();
-        // Strip per-row padding back to tightly packed RGBA.
-        let mut out = Vec::with_capacity((unpadded as usize) * (height as usize));
-        for row in 0..height as usize {
-            let start = row * padded as usize;
-            let end = start + unpadded as usize;
-            out.extend_from_slice(&data[start..end]);
-        }
-        drop(data);
-        readback.unmap();
-
-        Ok(out)
+    pub fn export_resources(&self) -> Option<ExportResources> {
+        Some(ExportResources {
+            export_pipeline: self.export_pipeline.clone(),
+            bind_group: self.bind_group.as_ref()?.clone(),
+            vertex_buffer: self.vertex_buffer.clone(),
+            settings_buffer: self.settings_buffer.clone(),
+        })
     }
 
     pub fn pipeline(&self) -> &wgpu::RenderPipeline {
@@ -904,4 +811,119 @@ impl TessellatorResources {
 
         texture
     }
+}
+
+pub fn render_export_resources_to_rgba8(
+    resources: &ExportResources,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    settings: ShaderSettings,
+) -> Result<Vec<u8>, &'static str> {
+    let unpadded = 4 * width;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let buffer_size = (padded as u64) * (height as u64);
+
+    let color_target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tessellator.export_target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = color_target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tessellator.export_readback"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    queue.write_buffer(
+        &resources.settings_buffer,
+        0,
+        bytemuck::cast_slice(&[settings]),
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("tessellator.export_encoder"),
+    });
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("tessellator.export_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rpass.set_pipeline(&resources.export_pipeline);
+        rpass.set_bind_group(0, &resources.bind_group, &[]);
+        rpass.set_vertex_buffer(0, resources.vertex_buffer.slice(..));
+        rpass.draw(0..6, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &color_target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|_| "device.poll failed")?;
+    rx.recv()
+        .map_err(|_| "map_async result channel dropped")?
+        .map_err(|_| "buffer map failed")?;
+
+    let data = slice.get_mapped_range();
+    let mut out = Vec::with_capacity((unpadded as usize) * (height as usize));
+    for row in 0..height as usize {
+        let start = row * padded as usize;
+        let end = start + unpadded as usize;
+        out.extend_from_slice(&data[start..end]);
+    }
+    drop(data);
+    readback.unmap();
+
+    Ok(out)
 }

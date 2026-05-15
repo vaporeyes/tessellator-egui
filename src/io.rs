@@ -66,7 +66,11 @@ fn read_file_bytes(path: &Path) -> std::io::Result<FileBytes> {
     match unsafe { Mmap::map(&file) } {
         Ok(mmap) => Ok(FileBytes::Mapped(mmap)),
         Err(e) => {
-            log::warn!("mmap failed for {:?}, falling back to buffered read: {}", path, e);
+            log::warn!(
+                "mmap failed for {:?}, falling back to buffered read: {}",
+                path,
+                e
+            );
             read_to_vec(&mut file, size).map(FileBytes::Heap)
         }
     }
@@ -143,12 +147,12 @@ fn is_likely_network_path(path: &Path) -> bool {
         // Linux statfs uses a magic number for the filesystem type.
         // Constants from <linux/magic.h>
         match buf.f_type as u32 {
-            0x6969 => true,      // NFS_SUPER_MAGIC
-            0x517B => true,      // SMB_SUPER_MAGIC
-            0x564C => true,      // NCP_SUPER_MAGIC (NetWare)
-            0xFE534D42 => true,  // SMB2_MAGIC_NUMBER
-            0x9753 => true,      // CIFS_MAGIC_NUMBER
-            0x1173 => true,      // CODA_SUPER_MAGIC
+            0x6969 => true,     // NFS_SUPER_MAGIC
+            0x517B => true,     // SMB_SUPER_MAGIC
+            0x564C => true,     // NCP_SUPER_MAGIC (NetWare)
+            0xFE534D42 => true, // SMB2_MAGIC_NUMBER
+            0x9753 => true,     // CIFS_MAGIC_NUMBER
+            0x1173 => true,     // CODA_SUPER_MAGIC
             _ => false,
         }
     }
@@ -188,7 +192,8 @@ fn is_likely_network_path(path: &Path) -> bool {
         root_wide.push(0);
 
         unsafe {
-            let drive_type = windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root_wide.as_ptr());
+            let drive_type =
+                windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root_wide.as_ptr());
             drive_type == windows_sys::Win32::Storage::FileSystem::DRIVE_REMOTE
         }
     } else {
@@ -216,10 +221,7 @@ fn is_jpeg(bytes: &[u8]) -> bool {
 /// (CMYK, 16-bit grayscale) so the caller can fall back. Returns the
 /// scaled image and the *original* (pre-scale) image dimensions so callers
 /// can report the source resolution to the user.
-fn try_decode_jpeg_scaled(
-    bytes: &[u8],
-    target_min_dim: u16,
-) -> Option<(DynamicImage, (u32, u32))> {
+fn try_decode_jpeg_scaled(bytes: &[u8], target_min_dim: u16) -> Option<(DynamicImage, (u32, u32))> {
     use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
 
     let mut decoder = JpegDecoder::new(Cursor::new(bytes));
@@ -332,29 +334,30 @@ fn read_exif_metadata(bytes: &[u8]) -> ExifMetadata {
         }
     };
 
-    let shutter = data.get_field(Tag::ExposureTime, In::PRIMARY).and_then(|f| {
-        if let Value::Rational(v) = &f.value
-            && let Some(r) = v.first()
-            && r.denom != 0
-        {
-            return Some(if r.num == 0 {
-                "0 s".to_string()
-            } else if r.num >= r.denom {
-                format!("{:.1} s", r.to_f64())
-            } else {
-                format!("1/{} s", (r.denom as f64 / r.num as f64).round() as u64)
-            });
-        }
-        None
-    });
+    let shutter = data
+        .get_field(Tag::ExposureTime, In::PRIMARY)
+        .and_then(|f| {
+            if let Value::Rational(v) = &f.value
+                && let Some(r) = v.first()
+                && r.denom != 0
+            {
+                return Some(if r.num == 0 {
+                    "0 s".to_string()
+                } else if r.num >= r.denom {
+                    format!("{:.1} s", r.to_f64())
+                } else {
+                    format!("1/{} s", (r.denom as f64 / r.num as f64).round() as u64)
+                });
+            }
+            None
+        });
 
     let aperture = rational_as_string(Tag::FNumber).map(|s| format!("f/{}", s));
     let focal_length = rational_as_string(Tag::FocalLength).map(|s| format!("{} mm", s));
     let focal_length_35mm =
         display(Tag::FocalLengthIn35mmFilm).map(|s| format!("{} mm (35mm eq)", s));
 
-    let date_taken =
-        display(Tag::DateTimeOriginal).or_else(|| display(Tag::DateTime));
+    let date_taken = display(Tag::DateTimeOriginal).or_else(|| display(Tag::DateTime));
 
     let make = display(Tag::Make);
     let model = display(Tag::Model);
@@ -394,6 +397,7 @@ pub struct DecodedImage {
     pub histogram: Histogram,
     pub palette: Vec<[u8; 3]>,
     pub exif: ExifMetadata,
+    pub is_preview: bool,
 }
 
 impl DecodedImage {
@@ -442,10 +446,14 @@ fn compute_histogram(rgba: &[u8], width: u32, height: u32) -> Histogram {
         let l = (px[0] as u32 * 299 + px[1] as u32 * 587 + px[2] as u32 * 114) / 1000;
         h.luma[l.min(255) as usize] += 1;
     }
-    h.max = h.r.iter().chain(h.g.iter()).chain(h.b.iter()).chain(h.luma.iter())
-        .copied()
-        .max()
-        .unwrap_or(0);
+    h.max =
+        h.r.iter()
+            .chain(h.g.iter())
+            .chain(h.b.iter())
+            .chain(h.luma.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
     h
 }
 
@@ -466,7 +474,9 @@ fn extract_palette(rgba: &[u8], width: u32, height: u32, target_count: usize) ->
         .step_by(stride)
         .map(|p| [p[0], p[1], p[2]])
         .collect();
-    if pixels.is_empty() { return Vec::new(); }
+    if pixels.is_empty() {
+        return Vec::new();
+    }
 
     // Index ranges into `pixels` so we can mutably sort each slice without
     // juggling overlapping borrows.
@@ -499,9 +509,7 @@ fn extract_palette(rgba: &[u8], width: u32, height: u32, target_count: usize) ->
         .map(|&(s, e)| average_color(&pixels[s..e]))
         .collect();
     // Sort by luma so the displayed swatches feel ordered.
-    palette.sort_by_key(|p| {
-        (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) as i32
-    });
+    palette.sort_by_key(|p| (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) as i32);
     palette
 }
 
@@ -511,14 +519,20 @@ fn widest_channel(pixels: &[[u8; 3]]) -> (usize, u8) {
     let mut mx = [0u8; 3];
     for p in pixels {
         for c in 0..3 {
-            if p[c] < mn[c] { mn[c] = p[c]; }
-            if p[c] > mx[c] { mx[c] = p[c]; }
+            if p[c] < mn[c] {
+                mn[c] = p[c];
+            }
+            if p[c] > mx[c] {
+                mx[c] = p[c];
+            }
         }
     }
     let mut best = (0, 0u8);
     for c in 0..3 {
         let range = mx[c].saturating_sub(mn[c]);
-        if range > best.1 { best = (c, range); }
+        if range > best.1 {
+            best = (c, range);
+        }
     }
     best
 }
@@ -572,13 +586,9 @@ impl From<image::ImageError> for DecodeError {
     }
 }
 
-fn decode_image_prepared(
-    path: &Path,
-    cancel: &CancelToken,
-) -> Result<DecodedImage, DecodeError> {
-    let bytes = read_file_bytes(path).map_err(|e| {
-        DecodeError::Image(image::ImageError::IoError(e))
-    })?;
+fn decode_image_prepared(path: &Path, cancel: &CancelToken) -> Result<DecodedImage, DecodeError> {
+    let bytes =
+        read_file_bytes(path).map_err(|e| DecodeError::Image(image::ImageError::IoError(e)))?;
     let exif = read_exif_metadata(bytes.as_slice());
     if cancel.is_cancelled() {
         return Err(DecodeError::Cancelled);
@@ -612,6 +622,45 @@ fn decode_image_prepared(
         histogram,
         palette,
         exif,
+        is_preview: false,
+    })
+}
+
+const LARGE_IMAGE_PREVIEW_MIN_FILE_BYTES: u64 = 12 * 1024 * 1024;
+const LARGE_IMAGE_PREVIEW_TARGET: u16 = 2048;
+
+fn decode_large_jpeg_preview(path: &Path, cancel: &CancelToken) -> Option<DecodedImage> {
+    let bytes = read_file_bytes(path).ok()?;
+    let slice = bytes.as_slice();
+    if !is_jpeg(slice) {
+        return None;
+    }
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let exif = read_exif_metadata(slice);
+    let (mut img, original_dims) = try_decode_jpeg_scaled(slice, LARGE_IMAGE_PREVIEW_TARGET)?;
+    let orientation = read_exif_orientation(slice);
+    img.apply_orientation(orientation);
+    let original_dims = orient_dims(original_dims, orientation);
+    let rgba = to_rgba8_consuming(img);
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let (width, height) = rgba.dimensions();
+    if (width, height) == original_dims {
+        return None;
+    }
+    let histogram = compute_histogram(rgba.as_raw(), width, height);
+    let palette = extract_palette(rgba.as_raw(), width, height, 8);
+    Some(DecodedImage {
+        width,
+        height,
+        rgba: rgba.into_raw(),
+        histogram,
+        palette,
+        exif,
+        is_preview: true,
     })
 }
 
@@ -620,15 +669,28 @@ fn decode_image_prepared(
 /// results populate the right-side compare slot.
 #[derive(Debug, Clone, Copy)]
 pub enum ImagePurpose {
-    Display { generation: u64 },
+    Display {
+        generation: u64,
+    },
+    PreviewDisplay {
+        generation: u64,
+    },
     Preload,
-    Compare { generation: u64 },
+    Compare {
+        generation: u64,
+    },
     /// Multi-image grid mode tile. `slot` is 1..=3 (slot 0 is the main image).
-    Grid { slot: u32, generation: u64 },
+    Grid {
+        slot: u32,
+        generation: u64,
+    },
 }
 
 pub enum Message {
-    FilesFound(Vec<ScannedFile>),
+    FilesFound {
+        generation: u64,
+        files: Vec<ScannedFile>,
+    },
     ThumbnailLoaded {
         path: PathBuf,
         image: egui::ColorImage,
@@ -650,6 +712,10 @@ pub enum Message {
     /// A change was detected in the watched folder. Debounced and re-scanned
     /// by the app, not directly handled here.
     FolderChanged,
+    ExportFinished {
+        path: PathBuf,
+        result: Result<(), String>,
+    },
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
@@ -669,6 +735,8 @@ pub struct ScannedFile {
 pub fn scan_folder(
     path: PathBuf,
     max_depth: usize,
+    generation: u64,
+    cancel: CancelToken,
     sender: Sender<Message>,
     ctx: egui::Context,
 ) {
@@ -681,6 +749,10 @@ pub fn scan_folder(
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
+            if cancel.is_cancelled() {
+                log::debug!("Folder scan cancelled: {:?} (gen {})", path, generation);
+                return;
+            }
             if is_image_file(entry.path()) {
                 let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 found.push(ScannedFile {
@@ -704,7 +776,18 @@ pub fn scan_folder(
             path,
             max_depth
         );
-        let _ = sender.send(Message::FilesFound(found));
+        if cancel.is_cancelled() {
+            log::debug!(
+                "Folder scan cancelled after walk: {:?} (gen {})",
+                path,
+                generation
+            );
+            return;
+        }
+        let _ = sender.send(Message::FilesFound {
+            generation,
+            files: found,
+        });
         ctx.request_repaint();
     });
 }
@@ -774,10 +857,7 @@ fn decode_thumbnail(path: &Path) -> Option<(DynamicImage, (u32, u32))> {
 
 /// Apply an EXIF Orientation to a (width, height) pair so the result
 /// matches what `DynamicImage::apply_orientation` would produce.
-fn orient_dims(
-    (w, h): (u32, u32),
-    orientation: image::metadata::Orientation,
-) -> (u32, u32) {
+fn orient_dims((w, h): (u32, u32), orientation: image::metadata::Orientation) -> (u32, u32) {
     use image::metadata::Orientation::*;
     match orientation {
         Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH => (h, w),
@@ -807,6 +887,19 @@ pub fn request_image(
             purpose,
             path.file_name().unwrap_or_default()
         );
+        if let ImagePurpose::Display { generation } = purpose {
+            let large = std::fs::metadata(&path)
+                .map(|m| m.len() >= LARGE_IMAGE_PREVIEW_MIN_FILE_BYTES)
+                .unwrap_or(false);
+            if large && let Some(img) = decode_large_jpeg_preview(&path, &cancel) {
+                let _ = sender.send(Message::ImageDecoded {
+                    path: path.clone(),
+                    image: Arc::new(img),
+                    purpose: ImagePurpose::PreviewDisplay { generation },
+                });
+                ctx.request_repaint();
+            }
+        }
         match decode_image_prepared(&path, &cancel) {
             Ok(img) => {
                 let _ = sender.send(Message::ImageDecoded {
@@ -855,6 +948,9 @@ mod tests {
         assert!(!t.is_cancelled());
         let t2 = t.clone();
         t2.cancel();
-        assert!(t.is_cancelled(), "cancellation must be visible across clones");
+        assert!(
+            t.is_cancelled(),
+            "cancellation must be visible across clones"
+        );
     }
 }

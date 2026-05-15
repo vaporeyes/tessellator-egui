@@ -12,11 +12,13 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::annotation::AnnotationLayer;
-use crate::pinboard::{self, DragState, PinnedItem, Pinboard};
 use crate::cache::ImageCache;
-use crate::gpu::{AnnotationUpload, CompareUpload, GridUpload, ShaderSettings, TessellatorCallback};
+use crate::gpu::{
+    AnnotationUpload, CompareUpload, GridUpload, ShaderSettings, TessellatorCallback,
+};
 use crate::io::{self, CancelToken, DecodedImage, ImagePurpose, Message};
-use crate::view::{view_matrix, ViewState};
+use crate::pinboard::{self, DragState, Pinboard, PinnedItem};
+use crate::view::{ViewState, view_matrix};
 use crate::watcher::FolderWatcher;
 
 /// Dynamic cache size: 25% of total system RAM, but at least 256MB and at most 8GB.
@@ -289,6 +291,7 @@ pub struct TessellatorApp {
     /// frame is in scope. The path is the destination chosen by the user;
     /// extension determines JPEG vs PNG encoding.
     pending_export: Option<PathBuf>,
+    export_in_progress: bool,
 
     /// Folder filesystem watcher; replaced when the folder changes.
     folder_watcher: Option<FolderWatcher>,
@@ -296,6 +299,8 @@ pub struct TessellatorApp {
     folder_refresh_at: Option<Instant>,
     /// On the next FilesFound, restore selection to this path if present.
     restore_selection: Option<PathBuf>,
+    scan_generation: u64,
+    scan_cancel: Option<CancelToken>,
 }
 
 #[derive(Clone, Copy)]
@@ -355,10 +360,9 @@ const RECENT_FOLDERS_MAX: usize = 8;
 
 impl TessellatorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let render_state = cc
-            .wgpu_render_state
-            .as_ref()
-            .expect("WGPU render state not available - eframe must be built with the wgpu renderer");
+        let render_state = cc.wgpu_render_state.as_ref().expect(
+            "WGPU render state not available - eframe must be built with the wgpu renderer",
+        );
         let target_format = render_state.target_format;
         let (sender, receiver) = crossbeam_channel::unbounded();
 
@@ -437,9 +441,12 @@ impl TessellatorApp {
             recent_folders: saved.recent_folders,
             cursor_pixel: None,
             pending_export: None,
+            export_in_progress: false,
             folder_watcher: None,
             folder_refresh_at: None,
             restore_selection: None,
+            scan_generation: 0,
+            scan_cancel: None,
         };
 
         if let Some(path) = saved.folder_path
@@ -491,12 +498,7 @@ impl TessellatorApp {
         self.cursor_pixel = None;
         self.clear_compare();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title("Tessellator".to_string()));
-        io::scan_folder(
-            path.clone(),
-            self.recursion_depth,
-            self.sender.clone(),
-            ctx.clone(),
-        );
+        self.start_folder_scan(path.clone(), ctx);
 
         // (Re)attach the watcher. Drop the old one first so we don't leak a
         // background thread on each folder change.
@@ -519,6 +521,24 @@ impl TessellatorApp {
         self.recent_folders.truncate(RECENT_FOLDERS_MAX);
     }
 
+    fn start_folder_scan(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if let Some(token) = self.scan_cancel.take() {
+            token.cancel();
+        }
+        self.scan_generation = self.scan_generation.wrapping_add(1);
+        let generation = self.scan_generation;
+        let token = CancelToken::new();
+        self.scan_cancel = Some(token.clone());
+        io::scan_folder(
+            path,
+            self.recursion_depth,
+            generation,
+            token,
+            self.sender.clone(),
+            ctx.clone(),
+        );
+    }
+
     fn start_compare(&mut self, path: PathBuf, ctx: &egui::Context) {
         // Cancel a prior compare-target if it differs from the new pick.
         if let Some(prev) = self.compare_path.take()
@@ -539,7 +559,9 @@ impl TessellatorApp {
             self.cancel_image_request(&path);
             self.dispatch_image_request(
                 path,
-                ImagePurpose::Compare { generation: self.compare_generation },
+                ImagePurpose::Compare {
+                    generation: self.compare_generation,
+                },
                 ctx,
             );
         }
@@ -579,7 +601,10 @@ impl TessellatorApp {
                 self.cancel_image_request(&p);
                 self.dispatch_image_request(
                     p,
-                    ImagePurpose::Grid { slot: tile_slot, generation: self.grid_generation },
+                    ImagePurpose::Grid {
+                        slot: tile_slot,
+                        generation: self.grid_generation,
+                    },
                     ctx,
                 );
             }
@@ -588,11 +613,7 @@ impl TessellatorApp {
 
     fn clear_grid_internal(&mut self) {
         // Cancel any pending grid decodes.
-        let pending: Vec<PathBuf> = self
-            .grid_paths
-            .iter()
-            .filter_map(|p| p.clone())
-            .collect();
+        let pending: Vec<PathBuf> = self.grid_paths.iter().filter_map(|p| p.clone()).collect();
         for p in pending {
             self.cancel_image_request(&p);
         }
@@ -629,7 +650,10 @@ impl TessellatorApp {
         purpose: ImagePurpose,
         ctx: &egui::Context,
     ) {
-        if let Some(prior) = self.pending_image_requests.insert(path.clone(), CancelToken::new()) {
+        if let Some(prior) = self
+            .pending_image_requests
+            .insert(path.clone(), CancelToken::new())
+        {
             prior.cancel();
         }
         let token = self
@@ -657,6 +681,7 @@ impl TessellatorApp {
     /// to load a sidecar for the new image.
     fn show_image(&mut self, image: Arc<DecodedImage>) {
         let (w, h) = (image.width, image.height);
+        let is_preview = image.is_preview;
         self.current_image_size = Some([w, h]);
         self.current_image = Some(image);
         self.needs_upload = true;
@@ -671,11 +696,15 @@ impl TessellatorApp {
         self.current_image_path = new_path.clone();
         if new_path != self.annotation_path {
             self.save_current_annotation();
-            self.annotation = new_path
-                .as_deref()
-                .and_then(|p| AnnotationLayer::load_sidecar(p, w, h));
+            self.annotation = if is_preview {
+                None
+            } else {
+                new_path
+                    .as_deref()
+                    .and_then(|p| AnnotationLayer::load_sidecar(p, w, h))
+            };
             self.annotation_needs_full_upload = self.annotation.is_some();
-            self.annotation_path = new_path;
+            self.annotation_path = if is_preview { None } else { new_path };
             self.last_paint_pos = None;
             self.erasing = false;
         }
@@ -692,7 +721,9 @@ impl TessellatorApp {
     /// surviving entry and trigger a rescan to pick up sidecar changes.
     fn delete_selected_to_trash(&mut self, ctx: &egui::Context) {
         let Some(i) = self.selected_index else { return };
-        let Some(entry) = self.files.get(i) else { return };
+        let Some(entry) = self.files.get(i) else {
+            return;
+        };
         let path = entry.path.clone();
         let name = entry.name.clone();
         let confirm = rfd::MessageDialog::new()
@@ -729,7 +760,9 @@ impl TessellatorApp {
                     } else {
                         self.dispatch_image_request(
                             p,
-                            ImagePurpose::Display { generation: self.high_res_generation },
+                            ImagePurpose::Display {
+                                generation: self.high_res_generation,
+                            },
                             ctx,
                         );
                     }
@@ -757,11 +790,25 @@ impl TessellatorApp {
     /// posterize, split-tone, clipping warning, annotation, manual rotation,
     /// flip-h) at native source resolution and write to `path` as PNG/JPEG
     /// based on extension. Skips loupe, compare, grid, overlays, and crop.
-    fn run_export(&mut self, path: &std::path::Path, frame: &mut eframe::Frame) {
+    fn run_export(
+        &mut self,
+        path: &std::path::Path,
+        frame: &mut eframe::Frame,
+        ctx: &egui::Context,
+    ) {
+        if self.export_in_progress {
+            self.last_load_error = Some("Export already in progress".to_string());
+            return;
+        }
         let Some(image) = self.current_image.clone() else {
             self.last_load_error = Some("Export: no image loaded".to_string());
             return;
         };
+        if image.is_preview {
+            self.last_load_error =
+                Some("Export: full-resolution image is still loading".to_string());
+            return;
+        }
         let Some(render_state) = frame.wgpu_render_state() else {
             self.last_load_error = Some("Export: no wgpu render state".to_string());
             return;
@@ -806,8 +853,18 @@ impl TessellatorApp {
             grid_count: 0,
             screen_aspect: out_w as f32 / out_h.max(1) as f32,
             manual_rotation: self.manual_rotation,
-            tile_image_aspects: [image.width as f32 / image.height.max(1) as f32, 0.0, 0.0, 0.0],
-            shadow_tint: [self.shadow_tint[0], self.shadow_tint[1], self.shadow_tint[2], 0.0],
+            tile_image_aspects: [
+                image.width as f32 / image.height.max(1) as f32,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            shadow_tint: [
+                self.shadow_tint[0],
+                self.shadow_tint[1],
+                self.shadow_tint[2],
+                0.0,
+            ],
             highlight_tint: [
                 self.highlight_tint[0],
                 self.highlight_tint[1],
@@ -816,58 +873,48 @@ impl TessellatorApp {
             ],
         };
 
-        let device = &render_state.device;
-        let queue = &render_state.queue;
+        let device = render_state.device.clone();
+        let queue = render_state.queue.clone();
         let renderer = render_state.renderer.read();
-        let Some(tess) = renderer
+        let Some(resources) = renderer
             .callback_resources
             .get::<crate::gpu::TessellatorResources>()
+            .and_then(|tess| tess.export_resources())
         else {
-            self.last_load_error =
-                Some("Export: render resources not initialised yet".to_string());
+            self.last_load_error = Some("Export: render resources not initialised yet".to_string());
             return;
         };
-
-        let rgba = match tess.render_to_rgba8(device, queue, out_w, out_h, settings) {
-            Ok(v) => v,
-            Err(e) => {
-                self.last_load_error = Some(format!("Export GPU readback failed: {}", e));
-                return;
-            }
-        };
-        // Drop the renderer read lock before doing disk I/O so the next paint
-        // isn't blocked on file write.
         drop(renderer);
 
-        let img = match image::RgbaImage::from_raw(out_w, out_h, rgba) {
-            Some(b) => b,
-            None => {
-                self.last_load_error = Some("Export: buffer size mismatch".to_string());
-                return;
-            }
-        };
-
-        // Extension drives encoder choice. JPEG strips alpha (the source is
-        // opaque after rendering, so this is lossless except for chroma).
+        let path = path.to_path_buf();
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
-        let result = match ext.as_str() {
-            "jpg" | "jpeg" => {
-                let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
-                rgb.save_with_format(path, image::ImageFormat::Jpeg)
-            }
-            _ => img.save_with_format(path, image::ImageFormat::Png),
-        };
-
-        match result {
-            Ok(()) => log::info!("Exported {} ({}x{})", path.display(), out_w, out_h),
-            Err(e) => {
-                self.last_load_error = Some(format!("Export write failed: {}", e));
-            }
-        }
+        self.export_in_progress = true;
+        let sender = self.sender.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let rgba = crate::gpu::render_export_resources_to_rgba8(
+                    &resources, &device, &queue, out_w, out_h, settings,
+                )
+                .map_err(|e| format!("GPU readback failed: {}", e))?;
+                let img = image::RgbaImage::from_raw(out_w, out_h, rgba)
+                    .ok_or_else(|| "buffer size mismatch".to_string())?;
+                match ext.as_str() {
+                    "jpg" | "jpeg" => {
+                        let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+                        rgb.save_with_format(&path, image::ImageFormat::Jpeg)
+                    }
+                    _ => img.save_with_format(&path, image::ImageFormat::Png),
+                }
+                .map_err(|e| format!("write failed: {}", e))
+            })();
+            let _ = sender.send(Message::ExportFinished { path, result });
+            ctx.request_repaint();
+        });
     }
 
     /// Rename the currently-selected image. We piggyback on rfd's native
@@ -876,7 +923,9 @@ impl TessellatorApp {
     /// folder; whatever the user types becomes the new filename.
     fn rename_selected(&mut self, ctx: &egui::Context) {
         let Some(i) = self.selected_index else { return };
-        let Some(entry) = self.files.get(i) else { return };
+        let Some(entry) = self.files.get(i) else {
+            return;
+        };
         let path = entry.path.clone();
         let current_name = entry.name.clone();
         let parent = match path.parent() {
@@ -894,7 +943,9 @@ impl TessellatorApp {
         };
         // Force same-folder rename: keep only the basename. Rejects empty
         // basenames (just in case the user erased everything).
-        let Some(new_name_os) = picked.file_name() else { return };
+        let Some(new_name_os) = picked.file_name() else {
+            return;
+        };
         let new_name = new_name_os.to_string_lossy().into_owned();
         if new_name.is_empty() {
             return;
@@ -919,10 +970,7 @@ impl TessellatorApp {
                     AnnotationLayer::sidecar_path(&path),
                     AnnotationLayer::sidecar_path(&new_path),
                 );
-                let _ = std::fs::rename(
-                    star_sidecar_path(&path),
-                    star_sidecar_path(&new_path),
-                );
+                let _ = std::fs::rename(star_sidecar_path(&path), star_sidecar_path(&new_path));
                 self.restore_selection = Some(new_path);
                 self.rescan_current_folder(ctx);
             }
@@ -944,7 +992,9 @@ impl TessellatorApp {
     /// run of `B` presses fans them out instead of hiding under each other.
     fn pin_selected_to_board(&mut self) {
         let Some(i) = self.selected_index else { return };
-        let Some(entry) = self.files.get(i) else { return };
+        let Some(entry) = self.files.get(i) else {
+            return;
+        };
         let path = entry.path.clone();
         // Derive aspect: prefer the full-image dims if currently loaded
         // (most accurate), fall back to thumbnail dims, then 1:1.
@@ -976,7 +1026,9 @@ impl TessellatorApp {
     /// the source of truth; toggling off removes the file.
     fn toggle_star_for_selected(&mut self) {
         let Some(i) = self.selected_index else { return };
-        let Some(entry) = self.files.get_mut(i) else { return };
+        let Some(entry) = self.files.get_mut(i) else {
+            return;
+        };
         entry.starred = !entry.starred;
         let path = entry.path.clone();
         let starred = entry.starred;
@@ -1049,11 +1101,15 @@ impl TessellatorApp {
     }
 
     fn save_current_annotation(&mut self) {
-        let Some(layer) = self.annotation.as_mut() else { return };
+        let Some(layer) = self.annotation.as_mut() else {
+            return;
+        };
         if !layer.touched || !layer.unsaved {
             return;
         }
-        let Some(path) = self.annotation_path.clone() else { return };
+        let Some(path) = self.annotation_path.clone() else {
+            return;
+        };
         layer.unsaved = false;
 
         // Empty layer -> delete the sidecar so erasing everything actually
@@ -1115,11 +1171,16 @@ impl TessellatorApp {
             // An in-flight Preload (or earlier request) will cover this. The
             // preload-completes-for-current-path branch in drain_messages will
             // surface it when ready.
-            log::debug!("Awaiting in-flight request: {:?}", path.file_name().unwrap_or_default());
+            log::debug!(
+                "Awaiting in-flight request: {:?}",
+                path.file_name().unwrap_or_default()
+            );
         } else {
             self.dispatch_image_request(
                 path,
-                ImagePurpose::Display { generation: self.high_res_generation },
+                ImagePurpose::Display {
+                    generation: self.high_res_generation,
+                },
                 ctx,
             );
         }
@@ -1155,7 +1216,9 @@ impl TessellatorApp {
     /// then (1) cancel anything pending that's outside it, (2) dispatch
     /// preloads for empty slots inside it.
     fn preload_neighbors(&mut self, ctx: &egui::Context) {
-        let Some(current) = self.selected_index else { return };
+        let Some(current) = self.selected_index else {
+            return;
+        };
         let neighbors = self.compute_preload_window(current);
 
         // Build the protected-paths set: the preload window plus the
@@ -1198,41 +1261,34 @@ impl TessellatorApp {
         }
     }
 
-    /// Two-image preload window. Stationary or weak streak: classic ±1.
-    /// Forward streak (≥ 2): N+1, N+2 (suspend N-1). Backward streak: mirror.
+    /// YACReader-style preload window: up to four images before and four
+    /// after the current one. Ordered by distance so adjacent images warm
+    /// first, with forward navigation getting the first slot at each distance.
     fn compute_preload_window(&self, current: usize) -> Vec<usize> {
-        let last = self.files.len();
-        let mut v = Vec::with_capacity(2);
-        if self.direction_streak >= 2 {
-            if current + 1 < last {
-                v.push(current + 1);
-            }
-            if current + 2 < last {
-                v.push(current + 2);
-            }
-        } else if self.direction_streak <= -2 {
-            if let Some(p) = current.checked_sub(1) {
-                v.push(p);
-            }
-            if let Some(p) = current.checked_sub(2) {
-                v.push(p);
-            }
-        } else {
-            if let Some(p) = current.checked_sub(1) {
-                v.push(p);
-            }
-            if current + 1 < last {
-                v.push(current + 1);
-            }
-        }
-        v
+        compute_preload_window(current, self.files.len())
     }
 
     fn drain_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
-                Message::FilesFound(scanned) => {
-                    self.files = scanned
+                Message::FilesFound { generation, files } => {
+                    if generation != self.scan_generation {
+                        log::debug!(
+                            "Discarding stale folder scan (gen {} != {})",
+                            generation,
+                            self.scan_generation
+                        );
+                        continue;
+                    }
+                    if self
+                        .scan_cancel
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    {
+                        continue;
+                    }
+                    self.scan_cancel = None;
+                    self.files = files
                         .into_iter()
                         .map(|s| FileEntry {
                             name: s
@@ -1257,7 +1313,11 @@ impl TessellatorApp {
                         self.pending_scroll_to_index = Some(i);
                     }
                 }
-                Message::ThumbnailLoaded { path, image, source_dims } => {
+                Message::ThumbnailLoaded {
+                    path,
+                    image,
+                    source_dims,
+                } => {
                     if let Some(entry) = self.files.iter_mut().find(|f| f.path == path) {
                         let handle = ctx.load_texture(
                             path.to_string_lossy(),
@@ -1271,11 +1331,28 @@ impl TessellatorApp {
                 Message::ThumbnailFailed => {
                     // Path stays in requested_thumbnails so we don't retry.
                 }
-                Message::ImageDecoded { path, image, purpose } => {
-                    self.pending_image_requests.remove(&path);
-                    self.image_cache.insert(path.clone(), image.clone());
+                Message::ImageDecoded {
+                    path,
+                    image,
+                    purpose,
+                } => {
                     match purpose {
+                        ImagePurpose::PreviewDisplay { generation } => {
+                            if generation != self.high_res_generation {
+                                continue;
+                            }
+                            let is_current_selection = self
+                                .selected_index
+                                .and_then(|i| self.files.get(i))
+                                .map(|f| f.path == path)
+                                .unwrap_or(false);
+                            if is_current_selection {
+                                self.show_image(image);
+                            }
+                        }
                         ImagePurpose::Display { generation } => {
+                            self.pending_image_requests.remove(&path);
+                            self.image_cache.insert(path.clone(), image.clone());
                             if generation != self.high_res_generation {
                                 log::debug!(
                                     "Discarding stale Display result (gen {} != {})",
@@ -1288,6 +1365,8 @@ impl TessellatorApp {
                             self.show_image(image);
                         }
                         ImagePurpose::Preload => {
+                            self.pending_image_requests.remove(&path);
+                            self.image_cache.insert(path.clone(), image.clone());
                             // Cached above; if the user has since navigated to
                             // this image, surface it now. Compare by path
                             // (not by dimensions) - two images in the same
@@ -1302,6 +1381,8 @@ impl TessellatorApp {
                             }
                         }
                         ImagePurpose::Compare { generation } => {
+                            self.pending_image_requests.remove(&path);
+                            self.image_cache.insert(path.clone(), image.clone());
                             if generation == self.compare_generation
                                 && self.compare_path.as_deref() == Some(&path)
                             {
@@ -1310,6 +1391,8 @@ impl TessellatorApp {
                             }
                         }
                         ImagePurpose::Grid { slot, generation } => {
+                            self.pending_image_requests.remove(&path);
+                            self.image_cache.insert(path.clone(), image.clone());
                             if generation == self.grid_generation {
                                 let i = (slot.saturating_sub(1)) as usize;
                                 if let Some(slot_path) =
@@ -1323,7 +1406,11 @@ impl TessellatorApp {
                         }
                     }
                 }
-                Message::ImageFailed { path, error, purpose } => {
+                Message::ImageFailed {
+                    path,
+                    error,
+                    purpose,
+                } => {
                     self.pending_image_requests.remove(&path);
                     let is_current_selection = self
                         .selected_index
@@ -1341,6 +1428,7 @@ impl TessellatorApp {
                                 error
                             ));
                         }
+                        ImagePurpose::PreviewDisplay { .. } => {}
                         ImagePurpose::Preload if is_current_selection => {
                             // The preload that select_image was relying on
                             // failed - the user is staring at a loading
@@ -1361,13 +1449,26 @@ impl TessellatorApp {
                     self.folder_refresh_at = Some(deadline);
                     ctx.request_repaint_after(FOLDER_REFRESH_DEBOUNCE + Duration::from_millis(50));
                 }
+                Message::ExportFinished { path, result } => {
+                    self.export_in_progress = false;
+                    match result {
+                        Ok(()) => {
+                            log::info!("Exported {}", path.display());
+                        }
+                        Err(e) => {
+                            self.last_load_error = Some(format!("Export failed: {}", e));
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Trigger a folder rescan once watcher events have quieted.
     fn process_folder_refresh(&mut self, ctx: &egui::Context) {
-        let Some(deadline) = self.folder_refresh_at else { return };
+        let Some(deadline) = self.folder_refresh_at else {
+            return;
+        };
         if Instant::now() < deadline {
             return;
         }
@@ -1382,7 +1483,9 @@ impl TessellatorApp {
     /// scratch - that path threw away ~512 MB of decoded mip chains for what
     /// is usually just a one-file delta.
     fn rescan_current_folder(&mut self, ctx: &egui::Context) {
-        let Some(folder) = self.folder_path.clone() else { return };
+        let Some(folder) = self.folder_path.clone() else {
+            return;
+        };
         // Pin selection to the current file so the scan resolves it back
         // when the new file list arrives.
         self.restore_selection = self
@@ -1395,12 +1498,7 @@ impl TessellatorApp {
         self.files.clear();
         self.selected_index = None;
         self.requested_thumbnails.clear();
-        io::scan_folder(
-            folder.clone(),
-            self.recursion_depth,
-            self.sender.clone(),
-            ctx.clone(),
-        );
+        self.start_folder_scan(folder.clone(), ctx);
         // Reattach the watcher: the prior one may have been invalidated by
         // an unmount or rename of the watched path.
         self.folder_watcher = None;
@@ -1569,7 +1667,7 @@ impl TessellatorApp {
 impl eframe::App for TessellatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         if let Some(path) = self.pending_export.take() {
-            self.run_export(&path, frame);
+            self.run_export(&path, frame, ui.ctx());
         }
         self.drain_messages(ui.ctx());
         self.process_folder_refresh(ui.ctx());
@@ -1655,9 +1753,8 @@ impl TessellatorApp {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| path.display().to_string());
-                                let resp = ui
-                                    .button(label)
-                                    .on_hover_text(path.display().to_string());
+                                let resp =
+                                    ui.button(label).on_hover_text(path.display().to_string());
                                 if resp.clicked() {
                                     open_folder = Some(path);
                                     ui.close();
@@ -1724,8 +1821,7 @@ impl TessellatorApp {
                 if let Some(i) = pending_scroll
                     && let Some(pos) = visible.iter().position(|v| *v == i)
                 {
-                    let target =
-                        (pos as f32) * row_height - viewport_h * 0.5 + row_height * 0.5;
+                    let target = (pos as f32) * row_height - viewport_h * 0.5 + row_height * 0.5;
                     scroll = scroll.vertical_scroll_offset(target.max(0.0));
                 }
 
@@ -1745,11 +1841,8 @@ impl TessellatorApp {
                         );
                         let visuals = ui.style().visuals.clone();
                         if is_selected {
-                            ui.painter().rect_filled(
-                                row_rect,
-                                6.0,
-                                visuals.selection.bg_fill,
-                            );
+                            ui.painter()
+                                .rect_filled(row_rect, 6.0, visuals.selection.bg_fill);
                         } else if row_resp.hovered() {
                             ui.painter().rect_filled(
                                 row_rect,
@@ -1771,17 +1864,14 @@ impl TessellatorApp {
                         let thumb_vec = egui::vec2(thumb_size, thumb_size);
                         if let Some(texture) = &entry.thumbnail {
                             child.add(
-                                egui::Image::new((texture.id(), thumb_vec))
-                                    .corner_radius(4.0),
+                                egui::Image::new((texture.id(), thumb_vec)).corner_radius(4.0),
                             );
                         } else {
                             let (rect, _) =
                                 child.allocate_exact_size(thumb_vec, egui::Sense::hover());
-                            child.painter().rect_filled(
-                                rect,
-                                4.0,
-                                visuals.faint_bg_color,
-                            );
+                            child
+                                .painter()
+                                .rect_filled(rect, 4.0, visuals.faint_bg_color);
                         }
 
                         child.add_space(8.0);
@@ -1792,8 +1882,7 @@ impl TessellatorApp {
                         // be unbounded and Truncate degenerates to Extend).
                         let star_glyph = if entry.starred { "★" } else { "☆" };
                         let star_w = 22.0;
-                        let name_max_w =
-                            (child.available_width() - star_w - 4.0).max(0.0);
+                        let name_max_w = (child.available_width() - star_w - 4.0).max(0.0);
 
                         // Filename + dimensions, stacked. Bold name on the
                         // top line (truncated with ellipsis), small dim
@@ -1815,15 +1904,10 @@ impl TessellatorApp {
                             egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
                                 ui.add_space(2.0);
-                                let name_text = egui::RichText::new(&entry.name)
-                                    .strong()
-                                    .color(name_color);
-                                ui.add(
-                                    egui::Label::new(name_text)
-                                        .truncate()
-                                        .selectable(false),
-                                )
-                                .on_hover_text(&entry.name);
+                                let name_text =
+                                    egui::RichText::new(&entry.name).strong().color(name_color);
+                                ui.add(egui::Label::new(name_text).truncate().selectable(false))
+                                    .on_hover_text(&entry.name);
                                 if let Some((w, h)) = entry.source_dims {
                                     ui.add(
                                         egui::Label::new(
@@ -1839,17 +1923,12 @@ impl TessellatorApp {
                         );
 
                         // Star button pinned to the right of the row.
-                        child.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let star = ui
-                                    .small_button(star_glyph)
-                                    .on_hover_text("Toggle star (S)");
-                                if star.clicked() {
-                                    star_toggle = Some(i);
-                                }
-                            },
-                        );
+                        child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let star = ui.small_button(star_glyph).on_hover_text("Toggle star (S)");
+                            if star.clicked() {
+                                star_toggle = Some(i);
+                            }
+                        });
 
                         // The whole row is a single click target for selection.
                         // Star clicks are absorbed by the button above (which
@@ -2077,9 +2156,7 @@ impl TessellatorApp {
             .default_width(280.0)
             .show(ctx, |ui| {
                 ui.heading("Split-tone");
-                ui.add(
-                    egui::Slider::new(&mut self.split_tone_amount, 0.0..=1.0).text("Amount"),
-                );
+                ui.add(egui::Slider::new(&mut self.split_tone_amount, 0.0..=1.0).text("Amount"));
                 ui.horizontal(|ui| {
                     ui.label("Shadows:");
                     ui.color_edit_button_rgb(&mut self.shadow_tint);
@@ -2173,7 +2250,11 @@ impl TessellatorApp {
                 }
             }
             Some(p) => {
-                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 ui.label(format!("vs {}", name));
                 if ui.button("X").on_hover_text("Stop comparing").clicked() {
                     self.clear_compare();
@@ -2208,16 +2289,25 @@ impl TessellatorApp {
                     }
                 }
                 ui.label(format!("Zoom: {}", format_zoom(self.view)));
+                if self
+                    .current_image
+                    .as_ref()
+                    .is_some_and(|img| img.is_preview)
+                {
+                    ui.separator();
+                    ui.label("Preview");
+                }
+                if self.export_in_progress {
+                    ui.separator();
+                    ui.label("Exporting...");
+                }
                 if let Some(s) = self.cursor_pixel {
                     ui.separator();
                     let [r, g, b, _a] = s.rgba;
                     let swatch_size = egui::vec2(14.0, 14.0);
                     let (rect, _) = ui.allocate_exact_size(swatch_size, egui::Sense::hover());
-                    ui.painter().rect_filled(
-                        rect,
-                        2.0,
-                        egui::Color32::from_rgb(r, g, b),
-                    );
+                    ui.painter()
+                        .rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
                     ui.label(format!(
                         "({}, {})  rgb({}, {}, {})  #{:02X}{:02X}{:02X}",
                         s.x, s.y, r, g, b, r, g, b
@@ -2264,17 +2354,10 @@ impl TessellatorApp {
             let rect = ui.max_rect();
             // Soft fill so the moodboard plane is visually distinct from
             // the single-image viewport.
-            ui.painter().rect_filled(
-                rect,
-                0.0,
-                ui.style().visuals.extreme_bg_color,
-            );
+            ui.painter()
+                .rect_filled(rect, 0.0, ui.style().visuals.extreme_bg_color);
 
-            let response = ui.interact(
-                rect,
-                pinboard_id,
-                egui::Sense::click_and_drag(),
-            );
+            let response = ui.interact(rect, pinboard_id, egui::Sense::click_and_drag());
             let mouse_pos = ui.input(|i| i.pointer.hover_pos());
 
             // Scroll-to-zoom around the cursor, like the single-image
@@ -2306,9 +2389,7 @@ impl TessellatorApp {
                 // Corner-handle hit radius is 8 screen pixels expressed in
                 // world units so it stays a constant on-screen size.
                 let handle_world = 8.0 / self.pinboard.view_scale.max(0.001);
-                if let Some((idx, corner)) =
-                    self.pinboard.hit_test(world, handle_world)
-                {
+                if let Some((idx, corner)) = self.pinboard.hit_test(world, handle_world) {
                     let raised = self.pinboard.raise(idx);
                     let item = &self.pinboard.items[raised];
                     self.pinboard.drag = match corner {
@@ -2366,7 +2447,7 @@ impl TessellatorApp {
                         }
                     }
                     DragState::Pan => {
-                        let delta = response.drag_delta();
+                        let delta = ui.input(|i| i.pointer.delta());
                         self.pinboard.view_center -= egui::vec2(
                             delta.x / self.pinboard.view_scale.max(0.001),
                             delta.y / self.pinboard.view_scale.max(0.001),
@@ -2390,9 +2471,7 @@ impl TessellatorApp {
                     egui::pos2(item.pos.x, item.pos.y),
                     egui::vec2(item.size.x, item.size.y),
                 );
-                let screen_rect = self
-                    .pinboard
-                    .world_to_screen_rect(world_rect, rect);
+                let screen_rect = self.pinboard.world_to_screen_rect(world_rect, rect);
 
                 // Skip drawing if entirely off-screen (cheap culling).
                 if !screen_rect.intersects(rect) {
@@ -2420,11 +2499,7 @@ impl TessellatorApp {
                     );
                     true
                 } else {
-                    painter.rect_filled(
-                        screen_rect,
-                        4.0,
-                        ui.style().visuals.faint_bg_color,
-                    );
+                    painter.rect_filled(screen_rect, 4.0, ui.style().visuals.faint_bg_color);
                     false
                 };
                 // Schedule a thumbnail request for items whose entry exists
@@ -2452,10 +2527,7 @@ impl TessellatorApp {
                         screen_rect.left_bottom(),
                         screen_rect.right_bottom(),
                     ] {
-                        let r = egui::Rect::from_center_size(
-                            p,
-                            egui::vec2(handle, handle),
-                        );
+                        let r = egui::Rect::from_center_size(p, egui::vec2(handle, handle));
                         painter.rect_filled(r, 2.0, egui::Color32::WHITE);
                         painter.rect_stroke(
                             r,
@@ -2509,8 +2581,8 @@ impl TessellatorApp {
                 .selected_index
                 .and_then(|i| self.files.get(i))
                 .map(|f| f.path.as_path());
-            let stale = selected_path.is_some()
-                && selected_path != self.current_image_path.as_deref();
+            let stale =
+                selected_path.is_some() && selected_path != self.current_image_path.as_deref();
             let waiting = selected_path
                 .map(|p| self.pending_image_requests.contains_key(p))
                 .unwrap_or(false);
@@ -2537,6 +2609,10 @@ impl TessellatorApp {
             let Some([img_w, img_h]) = self.current_image_size else {
                 return;
             };
+            let preview_active = self
+                .current_image
+                .as_ref()
+                .is_some_and(|img| img.is_preview);
             let img_w = img_w as f32;
             let img_h = img_h as f32;
 
@@ -2547,11 +2623,17 @@ impl TessellatorApp {
             match self.view {
                 ViewState::FitOnNextFrame => {
                     let zoom = (screen.x / img_w).min(screen.y / img_h);
-                    self.view = ViewState::Manual { zoom, pan: egui::Vec2::ZERO };
+                    self.view = ViewState::Manual {
+                        zoom,
+                        pan: egui::Vec2::ZERO,
+                    };
                 }
                 ViewState::FillOnNextFrame => {
                     let zoom = (screen.x / img_w).max(screen.y / img_h);
-                    self.view = ViewState::Manual { zoom, pan: egui::Vec2::ZERO };
+                    self.view = ViewState::Manual {
+                        zoom,
+                        pan: egui::Vec2::ZERO,
+                    };
                 }
                 ViewState::Manual { .. } => {}
             }
@@ -2618,7 +2700,7 @@ impl TessellatorApp {
                     let u = ((clip_x - pan.x) / scale_x.max(1e-3) + 1.0) * 0.5;
                     self.compare_divider = u.clamp(0.0, 1.0);
                 } else if !self.annotating {
-                    pan += response.drag_delta() / (screen * 0.5);
+                    pan += ui.input(|i| i.pointer.delta()) / (screen * 0.5);
                 }
             }
 
@@ -2641,16 +2723,17 @@ impl TessellatorApp {
             let scale_unflipped = if grid_active {
                 egui::vec2(zoom, zoom)
             } else {
-                egui::vec2(
-                    (display_w * zoom) / screen.x,
-                    (display_h * zoom) / screen.y,
-                )
+                egui::vec2((display_w * zoom) / screen.x, (display_h * zoom) / screen.y)
             };
             // Negative scale.x mirrors the displayed quad horizontally. Pass
             // this scale to screen_to_uv too so cursor → image-UV inverts
             // correctly under flip (loupe + eyedropper stay coherent).
             let scale = egui::vec2(
-                if self.flip_h { -scale_unflipped.x } else { scale_unflipped.x },
+                if self.flip_h {
+                    -scale_unflipped.x
+                } else {
+                    scale_unflipped.x
+                },
                 scale_unflipped.y,
             );
             let mouse_pos = ui.input(|i| i.pointer.hover_pos());
@@ -2658,7 +2741,7 @@ impl TessellatorApp {
             // Annotation painting: while annotation mode is on, the same
             // viewport drag that would otherwise pan instead deposits brush
             // stamps along the path of the cursor in image-pixel space.
-            if self.annotating && !grid_active {
+            if self.annotating && !grid_active && !preview_active {
                 if response.drag_started() {
                     self.last_paint_pos = None;
                 }
@@ -2666,6 +2749,7 @@ impl TessellatorApp {
                     && let Some(mp) = response.interact_pointer_pos()
                     && let Some(uv) = screen_to_uv(mp, rect, scale, pan)
                 {
+                    let uv = source_uv_from_display_uv(uv, self.manual_rotation);
                     let img_x = uv.x * img_w;
                     let img_y = uv.y * img_h;
                     if self.annotation.is_none() {
@@ -2684,13 +2768,7 @@ impl TessellatorApp {
                         255,
                     ];
                     if let Some(prev) = self.last_paint_pos {
-                        layer.stroke(
-                            prev,
-                            (img_x, img_y),
-                            self.brush_radius,
-                            color,
-                            self.erasing,
-                        );
+                        layer.stroke(prev, (img_x, img_y), self.brush_radius, color, self.erasing);
                     } else {
                         layer.stamp(img_x, img_y, self.brush_radius, color, self.erasing);
                     }
@@ -2702,19 +2780,16 @@ impl TessellatorApp {
                 }
             }
 
-            // Eyedropper: sample the pixel under the cursor at the mip the
-            // GPU is closest to displaying. Disabled in grid mode (UV no
-            // longer maps 1:1 to a single image) and when manual rotation
-            // is active (the CPU-side UV->pixel mapping doesn't yet apply
-            // the rotation, so the readout would be wrong).
-            self.cursor_pixel = if response.hovered() && !grid_active && self.manual_rotation == 0 {
+            // Eyedropper: sample the pixel under the cursor. Disabled in
+            // grid mode because UV no longer maps 1:1 to a single image.
+            self.cursor_pixel = if response.hovered() && !grid_active {
                 mouse_pos.and_then(|mouse| {
                     sample_pixel_at(
                         mouse,
                         rect,
                         scale,
                         pan,
-                        zoom,
+                        self.manual_rotation,
                         self.current_image.as_deref()?,
                     )
                 })
@@ -2784,7 +2859,12 @@ impl TessellatorApp {
                     }
                     a
                 },
-                shadow_tint: [self.shadow_tint[0], self.shadow_tint[1], self.shadow_tint[2], 0.0],
+                shadow_tint: [
+                    self.shadow_tint[0],
+                    self.shadow_tint[1],
+                    self.shadow_tint[2],
+                    0.0,
+                ],
                 highlight_tint: [
                     self.highlight_tint[0],
                     self.highlight_tint[1],
@@ -2889,7 +2969,6 @@ impl TessellatorApp {
             {
                 draw_histogram_overlay(ui, &image.histogram, rect);
             }
-
         });
     }
 
@@ -2917,9 +2996,7 @@ impl TessellatorApp {
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             egui::vec2(70.0, 0.0),
-                            egui::Label::new(
-                                egui::RichText::new(label).color(egui::Color32::GRAY),
-                            ),
+                            egui::Label::new(egui::RichText::new(label).color(egui::Color32::GRAY)),
                         );
                         ui.add(egui::Label::new(value).truncate());
                     });
@@ -2962,12 +3039,7 @@ impl TessellatorApp {
 
 /// Paint a crop-ratio preview: dim the area outside the centered crop rect
 /// (clipped to the displayed image), then stroke a thin outline + thirds.
-fn draw_crop_overlay(
-    ui: &egui::Ui,
-    viewport: egui::Rect,
-    image_rect: egui::Rect,
-    aspect: f32,
-) {
+fn draw_crop_overlay(ui: &egui::Ui, viewport: egui::Rect, image_rect: egui::Rect, aspect: f32) {
     // Fit the largest aspect-correct rect inside image_rect.
     let img_aspect = image_rect.width() / image_rect.height().max(1e-6);
     let (cw, ch) = if aspect >= img_aspect {
@@ -3007,19 +3079,31 @@ fn draw_crop_overlay(
     let third_y1 = crop.top() + crop.height() / 3.0;
     let third_y2 = crop.top() + crop.height() * 2.0 / 3.0;
     painter.line_segment(
-        [egui::pos2(third_x1, crop.top()), egui::pos2(third_x1, crop.bottom())],
+        [
+            egui::pos2(third_x1, crop.top()),
+            egui::pos2(third_x1, crop.bottom()),
+        ],
         thin,
     );
     painter.line_segment(
-        [egui::pos2(third_x2, crop.top()), egui::pos2(third_x2, crop.bottom())],
+        [
+            egui::pos2(third_x2, crop.top()),
+            egui::pos2(third_x2, crop.bottom()),
+        ],
         thin,
     );
     painter.line_segment(
-        [egui::pos2(crop.left(), third_y1), egui::pos2(crop.right(), third_y1)],
+        [
+            egui::pos2(crop.left(), third_y1),
+            egui::pos2(crop.right(), third_y1),
+        ],
         thin,
     );
     painter.line_segment(
-        [egui::pos2(crop.left(), third_y2), egui::pos2(crop.right(), third_y2)],
+        [
+            egui::pos2(crop.left(), third_y2),
+            egui::pos2(crop.right(), third_y2),
+        ],
         thin,
     );
 }
@@ -3038,11 +3122,7 @@ fn draw_histogram_overlay(ui: &egui::Ui, hist: &crate::io::Histogram, viewport: 
     let panel = egui::Rect::from_min_size(panel_min, egui::vec2(W, H));
 
     let painter = ui.painter().with_clip_rect(viewport);
-    painter.rect_filled(
-        panel.expand(4.0),
-        4.0,
-        egui::Color32::from_black_alpha(180),
-    );
+    painter.rect_filled(panel.expand(4.0), 4.0, egui::Color32::from_black_alpha(180));
 
     let plot = |color: egui::Color32, bins: &[u32; 256]| {
         let mut pts: Vec<egui::Pos2> = Vec::with_capacity(256);
@@ -3063,9 +3143,18 @@ fn draw_histogram_overlay(ui: &egui::Ui, hist: &crate::io::Histogram, viewport: 
         ));
     };
 
-    plot(egui::Color32::from_rgba_unmultiplied(255, 60, 60, 130), &hist.r);
-    plot(egui::Color32::from_rgba_unmultiplied(60, 220, 60, 130), &hist.g);
-    plot(egui::Color32::from_rgba_unmultiplied(80, 120, 255, 130), &hist.b);
+    plot(
+        egui::Color32::from_rgba_unmultiplied(255, 60, 60, 130),
+        &hist.r,
+    );
+    plot(
+        egui::Color32::from_rgba_unmultiplied(60, 220, 60, 130),
+        &hist.g,
+    );
+    plot(
+        egui::Color32::from_rgba_unmultiplied(80, 120, 255, 130),
+        &hist.b,
+    );
     // Luma overlay as a thin stroke so it sits readably on top of the channel fills.
     let luma_pts: Vec<egui::Pos2> = (0..256)
         .map(|i| {
@@ -3203,6 +3292,23 @@ fn next_streak(prev_streak: i32, signed_step: i32) -> i32 {
     }
 }
 
+fn compute_preload_window(current: usize, len: usize) -> Vec<usize> {
+    let mut window = Vec::with_capacity(8);
+    if current >= len {
+        return window;
+    }
+    for distance in 1..=4 {
+        let next = current + distance;
+        if next < len {
+            window.push(next);
+        }
+        if let Some(prev) = current.checked_sub(distance) {
+            window.push(prev);
+        }
+    }
+    window
+}
+
 fn format_zoom(view: ViewState) -> String {
     match view {
         ViewState::FitOnNextFrame => "Fit".to_string(),
@@ -3236,15 +3342,24 @@ fn screen_to_uv(
     Some(egui::vec2(u, v))
 }
 
+fn source_uv_from_display_uv(uv: egui::Vec2, rotation: u32) -> egui::Vec2 {
+    match rotation & 3 {
+        1 => egui::vec2(uv.y, 1.0 - uv.x),
+        2 => egui::vec2(1.0 - uv.x, 1.0 - uv.y),
+        3 => egui::vec2(1.0 - uv.y, uv.x),
+        _ => uv,
+    }
+}
+
 fn sample_pixel_at(
     mouse: egui::Pos2,
     rect: egui::Rect,
     scale: egui::Vec2,
     pan: egui::Vec2,
-    _zoom: f32,
+    rotation: u32,
     image: &DecodedImage,
 ) -> Option<CursorSample> {
-    let uv = screen_to_uv(mouse, rect, scale, pan)?;
+    let uv = source_uv_from_display_uv(screen_to_uv(mouse, rect, scale, pan)?, rotation);
 
     let mx = ((uv.x * image.width as f32) as u32).min(image.width.saturating_sub(1));
     let my = ((uv.y * image.height as f32) as u32).min(image.height.saturating_sub(1));
@@ -3325,6 +3440,15 @@ mod tests {
     }
 
     #[test]
+    fn source_uv_rotation_matches_shader_mapping() {
+        let uv = egui::vec2(0.25, 0.75);
+        assert_eq!(source_uv_from_display_uv(uv, 0), egui::vec2(0.25, 0.75));
+        assert_eq!(source_uv_from_display_uv(uv, 1), egui::vec2(0.75, 0.75));
+        assert_eq!(source_uv_from_display_uv(uv, 2), egui::vec2(0.75, 0.25));
+        assert_eq!(source_uv_from_display_uv(uv, 3), egui::vec2(0.25, 0.25));
+    }
+
+    #[test]
     fn streak_starts_from_zero() {
         assert_eq!(next_streak(0, 1), 1);
         assert_eq!(next_streak(0, -1), -1);
@@ -3354,5 +3478,21 @@ mod tests {
     fn streak_saturates_at_i32_bounds() {
         assert_eq!(next_streak(i32::MAX, 1), i32::MAX);
         assert_eq!(next_streak(i32::MIN, -1), i32::MIN);
+    }
+
+    #[test]
+    fn preload_window_loads_four_before_and_after() {
+        assert_eq!(compute_preload_window(5, 12), vec![6, 4, 7, 3, 8, 2, 9, 1]);
+    }
+
+    #[test]
+    fn preload_window_clamps_at_edges() {
+        assert_eq!(compute_preload_window(0, 5), vec![1, 2, 3, 4]);
+        assert_eq!(compute_preload_window(4, 5), vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn preload_window_ignores_out_of_range_current() {
+        assert!(compute_preload_window(5, 5).is_empty());
     }
 }
