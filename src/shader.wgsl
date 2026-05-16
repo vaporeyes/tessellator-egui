@@ -72,6 +72,14 @@ fn diag_alpha(uv: vec2<f32>) -> f32 {
     return max(a1, a2);
 }
 
+fn grid_line_alpha(scaled: vec2<f32>) -> f32 {
+    let cell = fract(scaled);
+    let dist = min(cell, 1.0 - cell);
+    let px = max(fwidth(scaled), vec2<f32>(0.0001));
+    let line = 1.0 - smoothstep(px * 0.5, px * 1.5, dist);
+    return max(line.x, line.y);
+}
+
 // Cheap PRNG-ish noise for dither, ~triangular distribution in [-0.5, 0.5].
 fn tri_noise(p: vec2<f32>) -> f32 {
     let n = fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
@@ -192,8 +200,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // rather than square in UV (which would stretch with aspect).
                 let aspect = settings.tile_image_aspects[0];
                 let scaled = vec2<f32>(ov.x * aspect, ov.y) * settings.grid_size;
-                let g = step(vec2<f32>(0.98), fract(scaled));
-                overlay = max(g.x, g.y);
+                overlay = grid_line_alpha(scaled);
             }
             case 2u: {
                 overlay = max(

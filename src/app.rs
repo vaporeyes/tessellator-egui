@@ -1678,13 +1678,15 @@ impl eframe::App for TessellatorApp {
         // and OS decorations independently.
         if !self.compact {
             self.show_sidebar(ui);
-            self.show_tools_panel(ui);
             self.show_status_bar(ui);
         }
         if self.pinboard_mode {
             self.show_pinboard(ui);
         } else {
             self.show_viewport(ui);
+        }
+        if !self.compact {
+            self.show_settings_window(ui.ctx());
         }
         self.show_color_window(ui.ctx());
         self.show_exif_window(ui.ctx());
@@ -1973,177 +1975,253 @@ impl TessellatorApp {
         }
     }
 
-    fn show_tools_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("tools").show_inside(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Grayscale:");
-                ui.add(egui::Slider::new(&mut self.grayscale, 0.0..=1.0));
-                ui.separator();
-                ui.checkbox(&mut self.value_study, "Values")
-                    .on_hover_text("Posterize to N bands for value study (V)");
-                if self.value_study {
-                    ui.add(egui::Slider::new(&mut self.value_levels, 2..=8).text("bands"));
-                }
-                ui.separator();
-                ui.checkbox(&mut self.flip_h, "Flip H")
-                    .on_hover_text("Mirror horizontally to spot composition issues (H)");
-                if ui
-                    .button(format!("Rotate {}", ["0°", "90°", "180°", "270°"][self.manual_rotation as usize]))
-                    .on_hover_text("Rotate clockwise (R) - hold Shift to go counter-clockwise")
-                    .clicked()
-                {
-                    self.manual_rotation = (self.manual_rotation + 1) & 3;
-                }
-                ui.separator();
-                ui.label("Crop:");
-                egui::ComboBox::from_id_salt("crop_ratio")
-                    .selected_text(self.crop_ratio.label())
-                    .show_ui(ui, |ui| {
-                        for r in [
-                            CropRatio::None,
-                            CropRatio::Square,
-                            CropRatio::FourFive,
-                            CropRatio::SixteenNine,
-                            CropRatio::Golden,
-                        ] {
-                            ui.selectable_value(&mut self.crop_ratio, r, r.label());
-                        }
-                    });
-                ui.separator();
-                ui.toggle_value(&mut self.annotating, "Annotate")
-                    .on_hover_text(
-                        "Drag to paint over the image; strokes save to a sidecar PNG (A)",
+    fn show_settings_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings_window"))
+            .default_pos(egui::pos2(310.0, 64.0))
+            .default_width(500.0)
+            .resizable(true)
+            .collapsible(true)
+            .vscroll(true)
+            .show(ctx, |ui| {
+                self.show_settings_controls(ui);
+            });
+    }
+
+    fn show_settings_controls(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("settings_list")
+            .num_columns(2)
+            .striped(true)
+            .spacing(egui::vec2(14.0, 6.0))
+            .show(ui, |ui| {
+                settings_row(ui, "Grayscale:", |ui| {
+                    ui.add_sized(
+                        egui::vec2(180.0, 0.0),
+                        egui::Slider::new(&mut self.grayscale, 0.0..=1.0),
                     );
-                if self.annotating {
-                    ui.color_edit_button_rgb(&mut self.brush_color);
-                    ui.add(egui::Slider::new(&mut self.brush_radius, 1.0..=200.0).text("px"));
-                    ui.toggle_value(&mut self.erasing, "Erase");
+                });
+
+                settings_row(ui, "Values:", |ui| {
+                    ui.checkbox(&mut self.value_study, "Enabled")
+                        .on_hover_text("Posterize to N bands for value study (V)");
+                    if self.value_study {
+                        ui.add(egui::Slider::new(&mut self.value_levels, 2..=8).text("bands"));
+                    }
+                });
+
+                settings_row(ui, "Transform:", |ui| {
+                    ui.checkbox(&mut self.flip_h, "Flip H")
+                        .on_hover_text("Mirror horizontally to spot composition issues (H)");
                     if ui
-                        .button("Clear")
-                        .on_hover_text("Remove all strokes and delete the sidecar PNG")
+                        .button(format!(
+                            "Rotate {}",
+                            ["0°", "90°", "180°", "270°"][self.manual_rotation as usize]
+                        ))
+                        .on_hover_text("Rotate clockwise (R) - hold Shift to go counter-clockwise")
                         .clicked()
                     {
-                        self.remove_current_annotation();
+                        self.manual_rotation = (self.manual_rotation + 1) & 3;
                     }
-                }
-                ui.separator();
-                ui.label("Overlay:");
-                egui::ComboBox::from_id_salt("overlay_mode")
-                    .selected_text(self.overlay_mode.label())
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            OverlayMode::None,
-                            OverlayMode::Grid,
-                            OverlayMode::RuleOfThirds,
-                            OverlayMode::GoldenRatio,
-                            OverlayMode::Diagonal,
-                        ] {
-                            ui.selectable_value(&mut self.overlay_mode, mode, mode.label());
+                });
+
+                settings_row(ui, "Crop:", |ui| {
+                    egui::ComboBox::from_id_salt("crop_ratio")
+                        .selected_text(self.crop_ratio.label())
+                        .show_ui(ui, |ui| {
+                            for r in [
+                                CropRatio::None,
+                                CropRatio::Square,
+                                CropRatio::FourFive,
+                                CropRatio::SixteenNine,
+                                CropRatio::Golden,
+                            ] {
+                                ui.selectable_value(&mut self.crop_ratio, r, r.label());
+                            }
+                        });
+                });
+
+                settings_row(ui, "Annotate:", |ui| {
+                    ui.toggle_value(&mut self.annotating, "Enabled")
+                        .on_hover_text(
+                            "Drag to paint over the image; strokes save to a sidecar PNG (A)",
+                        );
+                    if self.annotating {
+                        ui.color_edit_button_rgb(&mut self.brush_color);
+                        ui.add(egui::Slider::new(&mut self.brush_radius, 1.0..=200.0).text("px"));
+                        ui.toggle_value(&mut self.erasing, "Erase");
+                        if ui
+                            .button("Clear")
+                            .on_hover_text("Remove all strokes and delete the sidecar PNG")
+                            .clicked()
+                        {
+                            self.remove_current_annotation();
                         }
-                    });
-                if self.overlay_mode != OverlayMode::None {
-                    ui.label("Opacity:");
-                    ui.add(egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0));
-                    if self.overlay_mode == OverlayMode::Grid {
-                        ui.label("Size:");
-                        ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0));
                     }
-                }
-                ui.separator();
-                if ui.button("Fit").on_hover_text("Fit image to viewport (F)").clicked() {
-                    self.view = ViewState::FitOnNextFrame;
-                }
-                if ui.button("Fill").on_hover_text("Fill viewport, may crop (Shift+F)").clicked() {
-                    self.view = ViewState::FillOnNextFrame;
-                }
-                if ui.button("100%").on_hover_text("Display at native pixel size (1)").clicked() {
-                    self.view = ViewState::one_to_one();
-                }
-                ui.separator();
-                self.show_compare_controls(ui);
-                ui.separator();
-                self.show_grid_controls(ui);
-                ui.separator();
-                ui.checkbox(&mut self.dither, "Dither")
-                    .on_hover_text("Add 1-bit noise to remove gradient banding");
-                ui.separator();
-                ui.checkbox(&mut self.show_histogram, "Histogram")
-                    .on_hover_text("RGB + luminance histogram overlay");
-                ui.checkbox(&mut self.show_exif, "EXIF")
-                    .on_hover_text("Camera, lens, and capture settings panel");
-                ui.checkbox(&mut self.clipping_warning, "Clip")
-                    .on_hover_text(
+                });
+
+                settings_row(ui, "Overlay:", |ui| {
+                    egui::ComboBox::from_id_salt("overlay_mode")
+                        .selected_text(self.overlay_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                OverlayMode::None,
+                                OverlayMode::Grid,
+                                OverlayMode::RuleOfThirds,
+                                OverlayMode::GoldenRatio,
+                                OverlayMode::Diagonal,
+                            ] {
+                                ui.selectable_value(&mut self.overlay_mode, mode, mode.label());
+                            }
+                        });
+                    if self.overlay_mode != OverlayMode::None {
+                        ui.add(
+                            egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0)
+                                .text("Opacity"),
+                        );
+                        if self.overlay_mode == OverlayMode::Grid {
+                            ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0).text("Size"));
+                        }
+                    }
+                });
+
+                settings_row(ui, "Grid:", |ui| {
+                    let mut show_grid = self.overlay_mode == OverlayMode::Grid;
+                    if ui
+                        .checkbox(&mut show_grid, "Show")
+                        .on_hover_text("Show the composition grid overlay")
+                        .changed()
+                    {
+                        self.overlay_mode = if show_grid {
+                            OverlayMode::Grid
+                        } else {
+                            OverlayMode::None
+                        };
+                    }
+                    if self.overlay_mode == OverlayMode::Grid {
+                        ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0).text("Size"));
+                        ui.add(
+                            egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0)
+                                .text("Opacity"),
+                        );
+                    }
+                });
+
+                settings_row(ui, "View:", |ui| {
+                    if ui
+                        .button("Fit")
+                        .on_hover_text("Fit image to viewport (F)")
+                        .clicked()
+                    {
+                        self.view = ViewState::FitOnNextFrame;
+                    }
+                    if ui
+                        .button("Fill")
+                        .on_hover_text("Fill viewport, may crop (Shift+F)")
+                        .clicked()
+                    {
+                        self.view = ViewState::FillOnNextFrame;
+                    }
+                    if ui
+                        .button("100%")
+                        .on_hover_text("Display at native pixel size (1)")
+                        .clicked()
+                    {
+                        self.view = ViewState::one_to_one();
+                    }
+                });
+
+                settings_row(ui, "Compare:", |ui| {
+                    self.show_compare_controls(ui);
+                });
+
+                settings_row(ui, "Image Grid:", |ui| {
+                    self.show_grid_controls(ui);
+                });
+
+                settings_row(ui, "Render:", |ui| {
+                    ui.checkbox(&mut self.dither, "Dither")
+                        .on_hover_text("Add 1-bit noise to remove gradient banding");
+                    ui.checkbox(&mut self.clipping_warning, "Clip").on_hover_text(
                         "Highlight clipped pixels - magenta = blown highlights, cyan = crushed shadows",
                     );
-                if ui
-                    .toggle_value(&mut self.show_color_panel, "Color...")
-                    .on_hover_text("Open palette + split-tone controls")
-                    .clicked()
-                {
-                    // toggle_value already flips it; this is just for the click side-effect
-                }
-                ui.separator();
-                let prev_ref = self.reference_mode;
-                ui.toggle_value(&mut self.reference_mode, "On top")
-                    .on_hover_text("Always-on-top + borderless (T)");
-                if self.reference_mode != prev_ref {
-                    self.apply_reference_mode(ui.ctx());
-                }
-                ui.toggle_value(&mut self.compact, "Compact")
-                    .on_hover_text("Hide all panels - just the image (\\)");
-                ui.separator();
-                ui.toggle_value(&mut self.pinboard_mode, "Pinboard")
-                    .on_hover_text("Moodboard canvas - drag, resize, arrange (P)");
-                if self.pinboard_mode
-                    && ui
-                        .button("Pin selected")
-                        .on_hover_text("Add the current image to the pinboard (B)")
-                        .clicked()
-                {
-                    self.pin_selected_to_board();
-                }
-                ui.separator();
-                if self.selected_index.is_some() {
-                    if ui
-                        .button("Rename...")
-                        .on_hover_text("Rename the current image (sidecars follow)")
-                        .clicked()
-                    {
-                        self.rename_selected(ui.ctx());
+                });
+
+                settings_row(ui, "Panels:", |ui| {
+                    ui.checkbox(&mut self.show_histogram, "Histogram")
+                        .on_hover_text("RGB + luminance histogram overlay");
+                    ui.checkbox(&mut self.show_exif, "EXIF")
+                        .on_hover_text("Camera, lens, and capture settings panel");
+                    ui.toggle_value(&mut self.show_color_panel, "Color...")
+                        .on_hover_text("Open palette + split-tone controls")
+                        .clicked();
+                });
+
+                settings_row(ui, "Window:", |ui| {
+                    let prev_ref = self.reference_mode;
+                    ui.toggle_value(&mut self.reference_mode, "On top")
+                        .on_hover_text("Always-on-top + borderless (T)");
+                    if self.reference_mode != prev_ref {
+                        self.apply_reference_mode(ui.ctx());
                     }
-                    if ui
-                        .button("Trash")
-                        .on_hover_text("Send the current image to the OS trash (Cmd+Delete)")
-                        .clicked()
-                    {
-                        self.delete_selected_to_trash(ui.ctx());
-                    }
-                    if self.current_image.is_some()
+                    ui.toggle_value(&mut self.compact, "Compact")
+                        .on_hover_text("Hide all panels - just the image (\\)");
+                });
+
+                settings_row(ui, "Pinboard:", |ui| {
+                    ui.toggle_value(&mut self.pinboard_mode, "Enabled")
+                        .on_hover_text("Moodboard canvas - drag, resize, arrange (P)");
+                    if self.pinboard_mode
                         && ui
-                            .button("Export...")
-                            .on_hover_text(
-                                "Render the image with current effects to a new JPEG/PNG",
-                            )
+                            .button("Pin selected")
+                            .on_hover_text("Add the current image to the pinboard (B)")
                             .clicked()
                     {
-                        let default_name = self
-                            .current_image_path
-                            .as_ref()
-                            .and_then(|p| p.file_stem())
-                            .map(|s| format!("{}_export.png", s.to_string_lossy()))
-                            .unwrap_or_else(|| "export.png".to_string());
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("PNG", &["png"])
-                            .add_filter("JPEG", &["jpg", "jpeg"])
-                            .set_file_name(default_name)
-                            .save_file()
-                        {
-                            self.pending_export = Some(path);
-                        }
+                        self.pin_selected_to_board();
                     }
+                });
+
+                if self.selected_index.is_some() {
+                    settings_row(ui, "File:", |ui| {
+                        if ui
+                            .button("Rename...")
+                            .on_hover_text("Rename the current image (sidecars follow)")
+                            .clicked()
+                        {
+                            self.rename_selected(ui.ctx());
+                        }
+                        if ui
+                            .button("Trash")
+                            .on_hover_text("Send the current image to the OS trash (Cmd+Delete)")
+                            .clicked()
+                        {
+                            self.delete_selected_to_trash(ui.ctx());
+                        }
+                        if self.current_image.is_some()
+                            && ui
+                                .button("Export...")
+                                .on_hover_text(
+                                    "Render the image with current effects to a new JPEG/PNG",
+                                )
+                                .clicked()
+                        {
+                            let default_name = self
+                                .current_image_path
+                                .as_ref()
+                                .and_then(|p| p.file_stem())
+                                .map(|s| format!("{}_export.png", s.to_string_lossy()))
+                                .unwrap_or_else(|| "export.png".to_string());
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("PNG", &["png"])
+                                .add_filter("JPEG", &["jpg", "jpeg"])
+                                .set_file_name(default_name)
+                                .save_file()
+                            {
+                                self.pending_export = Some(path);
+                            }
+                        }
+                    });
                 }
             });
-        });
     }
 
     fn show_color_window(&mut self, ctx: &egui::Context) {
@@ -2208,10 +2286,7 @@ impl TessellatorApp {
 
     fn show_grid_controls(&mut self, ui: &mut egui::Ui) {
         if self.grid_paths.is_empty() {
-            if ui
-                .button("Grid...")
-                .on_hover_text("Pick 2-4 images to compare side-by-side")
-                .clicked()
+            if ui.button("Pick images...").clicked()
                 && let Some(paths) = rfd::FileDialog::new()
                     .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
                     .pick_files()
@@ -3035,6 +3110,12 @@ impl TessellatorApp {
         // toggle stays in sync.
         self.show_exif = open;
     }
+}
+
+fn settings_row(ui: &mut egui::Ui, label: &str, controls: impl FnOnce(&mut egui::Ui)) {
+    ui.label(egui::RichText::new(label).color(ui.visuals().hyperlink_color));
+    ui.horizontal_wrapped(controls);
+    ui.end_row();
 }
 
 /// Paint a crop-ratio preview: dim the area outside the centered crop rect
