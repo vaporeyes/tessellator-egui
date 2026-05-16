@@ -81,6 +81,18 @@ impl CropRatio {
         }
     }
 
+    /// Next ratio in the cycle, wrapping back to `None`. Used by the toolbar
+    /// crop icon, which has no dropdown to pick a specific ratio.
+    fn next(self) -> Self {
+        match self {
+            Self::None => Self::Square,
+            Self::Square => Self::FourFive,
+            Self::FourFive => Self::SixteenNine,
+            Self::SixteenNine => Self::Golden,
+            Self::Golden => Self::None,
+        }
+    }
+
     /// Aspect ratio as width / height. `None` means no crop overlay.
     fn aspect(self) -> Option<f32> {
         match self {
@@ -301,6 +313,10 @@ pub struct TessellatorApp {
     restore_selection: Option<PathBuf>,
     scan_generation: u64,
     scan_cancel: Option<CancelToken>,
+    /// Embedded brand art (logo, launch hero) and About-window state.
+    branding: crate::branding::Branding,
+    /// macOS menu-bar presence (no-op on other platforms).
+    tray: crate::tray::TrayHost,
 }
 
 #[derive(Clone, Copy)]
@@ -447,6 +463,8 @@ impl TessellatorApp {
             restore_selection: None,
             scan_generation: 0,
             scan_cancel: None,
+            branding: crate::branding::Branding::default(),
+            tray: crate::tray::TrayHost::default(),
         };
 
         if let Some(path) = saved.folder_path
@@ -1666,6 +1684,7 @@ impl TessellatorApp {
 
 impl eframe::App for TessellatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.tray.update(ui.ctx());
         if let Some(path) = self.pending_export.take() {
             self.run_export(&path, frame, ui.ctx());
         }
@@ -1690,6 +1709,7 @@ impl eframe::App for TessellatorApp {
         }
         self.show_color_window(ui.ctx());
         self.show_exif_window(ui.ctx());
+        self.branding.show_about_window(ui.ctx());
         self.show_drop_overlay(ui.ctx());
     }
 
@@ -1738,7 +1758,18 @@ impl TessellatorApp {
             .resizable(true)
             .default_size(250.0)
             .show_inside(ui, |ui| {
-                ui.heading("Tessellator");
+                ui.horizontal(|ui| {
+                    ui.heading("Tessellator");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("About")
+                            .on_hover_text("About Tessellator")
+                            .clicked()
+                        {
+                            self.branding.about_open = true;
+                        }
+                    });
+                });
                 ui.horizontal(|ui| {
                     let btn = ui
                         .button("Open Folder...")
@@ -1989,6 +2020,8 @@ impl TessellatorApp {
     }
 
     fn show_settings_controls(&mut self, ui: &mut egui::Ui) {
+        self.show_tool_icons(ui);
+        ui.separator();
         egui::Grid::new("settings_list")
             .num_columns(2)
             .striped(true)
@@ -2222,6 +2255,117 @@ impl TessellatorApp {
                     });
                 }
             });
+    }
+
+    /// Quick-action icon bar at the top of the Settings window. Glyphs are the
+    /// sliced toolbar sheet; each reuses the same handler the text controls do.
+    /// Mapping (sheet order): 0 Value study, 1 Crop, 2 Export, 3 Annotate,
+    /// 4 Reference mode, 5 Color panel, 6 Compare, 7 EXIF, 8 Grid, 9 Pinboard.
+    fn show_tool_icons(&mut self, ui: &mut egui::Ui) {
+        const NAMES: [&str; 10] = [
+            "Value study",
+            "Crop ratio",
+            "Export...",
+            "Annotate",
+            "Reference mode",
+            "Color panel",
+            "Compare...",
+            "EXIF",
+            "Grid (3-up)",
+            "Pinboard",
+        ];
+        let active: [bool; 10] = [
+            self.value_study,
+            !matches!(self.crop_ratio, CropRatio::None),
+            false, // Export is an action, never a persistent toggle.
+            self.annotating,
+            self.reference_mode,
+            self.show_color_panel,
+            self.compare_path.is_some(),
+            self.show_exif,
+            !self.grid_paths.is_empty(),
+            self.pinboard_mode,
+        ];
+
+        let accent = ui.visuals().selection.stroke.color;
+        let idle = ui.visuals().strong_text_color();
+        let size = egui::vec2(22.0, 22.0);
+        let mut clicked: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            for i in 0..10 {
+                let tex = self.branding.toolbar_texture(ui.ctx(), i);
+                let tint = if active[i] { accent } else { idle };
+                let btn = egui::Button::image(
+                    egui::Image::new(&tex).fit_to_exact_size(size).tint(tint),
+                );
+                if ui.add(btn).on_hover_text(NAMES[i]).clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+
+        if let Some(i) = clicked {
+            let ctx = ui.ctx().clone();
+            match i {
+                0 => self.value_study = !self.value_study,
+                1 => self.crop_ratio = self.crop_ratio.next(),
+                2 => self.trigger_export(),
+                3 => self.annotating = !self.annotating,
+                4 => {
+                    self.reference_mode = !self.reference_mode;
+                    self.apply_reference_mode(&ctx);
+                }
+                5 => self.show_color_panel = !self.show_color_panel,
+                6 => {
+                    if self.compare_path.is_some() {
+                        self.clear_compare();
+                    } else if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                        .pick_file()
+                    {
+                        self.start_compare(path, &ctx);
+                    }
+                }
+                7 => self.show_exif = !self.show_exif,
+                8 => {
+                    if !self.grid_paths.is_empty() {
+                        self.clear_grid();
+                    } else if let Some(paths) = rfd::FileDialog::new()
+                        .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                        .pick_files()
+                    {
+                        let extras: Vec<PathBuf> = paths.into_iter().take(3).collect();
+                        if !extras.is_empty() {
+                            self.start_grid(extras, &ctx);
+                        }
+                    }
+                }
+                9 => self.pinboard_mode = !self.pinboard_mode,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// Open the export save dialog for the current image. Mirrors the inline
+    /// Export button in the File row so the toolbar icon can trigger it too.
+    fn trigger_export(&mut self) {
+        if self.current_image.is_none() {
+            return;
+        }
+        let default_name = self
+            .current_image_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{}_export.png", s.to_string_lossy()))
+            .unwrap_or_else(|| "export.png".to_string());
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG", &["png"])
+            .add_filter("JPEG", &["jpg", "jpeg"])
+            .set_file_name(default_name)
+            .save_file()
+        {
+            self.pending_export = Some(path);
+        }
     }
 
     fn show_color_window(&mut self, ctx: &egui::Context) {
@@ -2642,8 +2786,15 @@ impl TessellatorApp {
             }
 
             if self.selected_index.is_none() {
-                ui.heading("Viewer");
-                ui.label("Select an image to view, or use the arrow keys to navigate.");
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        self.branding.show_launch_hero(ui);
+                        ui.add_space(12.0);
+                        ui.label(
+                            "Select an image to view, or use the arrow keys to navigate.",
+                        );
+                    });
+                });
                 return;
             }
 

@@ -13,7 +13,9 @@
       "Bash(cargo search *)",
       "Read(//Users/jsh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/**)",
       "Bash(RUST_BACKTRACE=full timeout 5 /Users/jsh/dev/projects/tessellator-egui/target/release/tessellator-egui)",
-      "Bash(cargo tree *)"
+      "Bash(cargo tree *)",
+      "Read(//Users/jsh/Downloads/tessellator-icons/**)",
+      "Bash(sips -g pixelWidth -g pixelHeight /Users/jsh/Downloads/tessellator-icons/*.png)"
     ]
   }
 }

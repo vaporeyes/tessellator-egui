@@ -3,10 +3,12 @@
 
 mod annotation;
 mod app;
+mod branding;
 mod cache;
 mod gpu;
 mod io;
 mod pinboard;
+mod tray;
 mod view;
 mod watcher;
 
@@ -45,6 +47,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
+            .with_icon(branding::window_icon())
             .with_drag_and_drop(true),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,

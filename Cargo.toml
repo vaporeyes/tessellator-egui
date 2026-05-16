@@ -2,6 +2,16 @@
 name = "tessellator-egui"
 version = "0.1.0"
 edition = "2024"
+description = "A high-definition photo viewer for artists"
+
+# Bundling metadata for `cargo bundle` (e.g. `cargo bundle --release`), which
+# produces a macOS .app whose Finder/Dock icon is the generated .icns.
+[package.metadata.bundle]
+name = "Tessellator"
+identifier = "com.tessellator.viewer"
+icon = ["assets/Tessellator.icns"]
+category = "public.app-category.photography"
+short_description = "A high-definition photo viewer for artists"
 
 [dependencies]
 eframe = { version = "=0.34.1", features = ["wgpu", "persistence"] }
@@ -25,6 +35,12 @@ wide = "0.7"
 # Cross-platform "send to recycle bin" so delete is recoverable. Avoids the
 # data-loss footgun of a raw fs::remove_file in a photo viewer.
 trash = "5"
+
+# Menu-bar (system tray) presence. macOS-only on purpose: the Menu Bar Icon
+# asset is a macOS-style template, and gating to macOS avoids pulling the
+# gtk/libxdo stack that tray-icon needs on Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = "0.24"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

@@ -32,6 +32,8 @@ Designed for the "flip rapidly through a folder of references" workflow, with ex
 - **Clipping warning.** Magenta over blown highlights, cyan over crushed shadows.
 - **EXIF orientation.** Phone photos display upright.
 - **Persistence.** Last folder, panel sizes, and tool settings restore on launch.
+- **Quick-tool icon bar.** Top of the Settings window: one-click toggles for value study, crop, export, annotate, reference mode, color panel, compare, EXIF, grid, and pinboard.
+- **Branding.** App/window icon, an About window, launch art shown before a folder is opened, and (macOS) a menu-bar icon with show/hide/quit.
 
 ## Build & run
 
@@ -48,6 +50,19 @@ To enable verbose logging:
 ```sh
 RUST_LOG=debug cargo run --release
 ```
+
+### macOS app bundle
+
+To produce a distributable `Tessellator.app` with the Finder/Dock icon:
+
+```sh
+cargo install cargo-bundle
+cargo bundle --release
+```
+
+The bundle icon comes from `assets/Tessellator.icns`. To regenerate it after
+changing `assets/app_icon.png`, build an `.iconset` of the standard sizes and
+run `iconutil -c icns`.
 
 ## Keyboard shortcuts
 
