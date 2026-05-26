@@ -67,6 +67,14 @@ The decoder reads from `Cursor<&[u8]>` over the underlying slice — no kernel-t
 - Falls back to the full image-crate decode for non-JPEG, CMYK JPEGs, and L16 grayscale JPEGs.
 - Either way, then `.thumbnail(128, 128)` for final downsample.
 
+**JPEG 2000** (`.jp2`/`.j2k`/`.jpf`/`.jpx`/`.j2c`/`.jpc`) is decoded by the `jpeg2k` crate (pure-Rust `openjp2` backend, no C/cmake). The `image` crate handles neither container nor codestream. `io::is_jp2` sniffs magic bytes (JP2 signature box or the `FF 4F FF 51` SOC marker) so the byte-only decode functions can route without an extension. Both `decode_image_from_bytes` and the `decode_thumbnail` fallback branch on it; `jpeg2k::Image::from_bytes` then `DynamicImage::try_from` (interop works because jpeg2k pins `image` 0.25, unified with ours). JP2 has no EXIF orientation and no DCT-scale fast path, so thumbnails decode at full resolution.
+
+### Comic archives (CBZ/CBR)
+
+`archive.rs` adds comic support by *extracting to a temp folder*, so the rest of the app needs no archive-awareness - a comic becomes an ordinary folder of pages. `is_archive_file` matches `.cbz`/`.cbr` (deliberately NOT in `io::IMAGE_EXTENSIONS`, so archives are entered on open, not listed inside folder scans). `extract_to_temp` writes image entries (filtered by `is_image_file`) as zero-padded indices (`00000.jpg`, ...) in archive-iteration order, so the folder's filename sort reproduces page order. CBZ uses the pure-Rust `zip` crate; CBR uses `unrar` (bundled C++ unrar via `unrar_sys`, strict front-to-back cursor: `read_header` then `extract_to`/`skip`).
+
+Flow in `app.rs`: `open_path_list` routes archives to `open_archive`, which extracts on a one-off thread and sends `Message::ArchiveExtracted`. The handler calls `exit_archive_mode` (deletes the prior temp dir), records `current_archive`/`archive_temp`, pushes the *archive* (not the temp dir) to recents, sets `pending_select_first`, and `load_folder(temp)`. `open_folder` is the normal-folder wrapper (exit archive + recents + `load_folder`); `load_folder` is the shared core. Persistence saves `archive_path` instead of `folder_path` when in a comic (the temp dir won't exist next launch), reopening (re-extracting) it on startup. `Drop` removes the temp dir on exit; killed processes leak it to the OS temp cleaner.
+
 ### High-res upload path
 
 CPU prep is concentrated in the decode worker. `io::decode_image_with_mips` produces a `DecodedImage { width, height, mips: Vec<MipLevel> }` where each `MipLevel` is raw RGBA bytes ready for `queue.write_texture`. The render thread does almost no CPU work — just iterating mips and uploading. **Do not move mip generation back into `TessellatorResources::set_main_texture`**; that's what made the viewer feel sluggish before this change.

@@ -9,7 +9,28 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Dedicated rayon pool for high-resolution image decodes (Display,
+/// PreviewDisplay, Preload, Compare, Grid). Isolating these from the global
+/// rayon pool prevents a burst of rapid-fire navigation from queueing dozens
+/// of multi-second decodes ahead of cheap thumbnail jobs. Thumbnails continue
+/// to run on the global pool so the sidebar stays responsive while a large
+/// image decodes. Pool size is half the available cores (min 2): mip
+/// generation inside a decode parallelizes within this pool, and the other
+/// half remains available to the global pool for thumbnails.
+fn highres_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = (rayon::current_num_threads() / 2).max(2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("tess-highres-{i}"))
+            .build()
+            .expect("build tess-highres rayon pool")
+    })
+}
 
 /// Cooperative cancellation handle shared between the app (which decides to
 /// cancel) and the rayon worker (which polls at known checkpoints). Cheap to
@@ -748,9 +769,13 @@ pub enum Message {
         result: Result<(), String>,
     },
     /// A comic archive finished extracting to a temp folder (or failed).
+    /// `generation` lets the UI discard the result if it has since opened a
+    /// different folder/archive (e.g. a Finder "Open With" arrived while the
+    /// last-session comic was still being extracted on startup).
     ArchiveExtracted {
         archive: PathBuf,
         result: Result<PathBuf, String>,
+        generation: u64,
     },
 }
 
@@ -920,7 +945,7 @@ pub fn request_image(
     sender: Sender<Message>,
     ctx: egui::Context,
 ) {
-    rayon::spawn(move || {
+    highres_pool().spawn(move || {
         // Cancelled while queued (rare but possible under heavy traversal).
         if cancel.is_cancelled() {
             log::debug!(

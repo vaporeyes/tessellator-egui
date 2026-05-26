@@ -35,12 +35,33 @@ wide = "0.7"
 # Cross-platform "send to recycle bin" so delete is recoverable. Avoids the
 # data-loss footgun of a raw fs::remove_file in a photo viewer.
 trash = "5"
+jpeg2k = { version = "0.10", default-features = false, features = ["openjp2", "image"] }
+zip = { version = "2", default-features = false, features = ["deflate", "bzip2"] }
+unrar = "0.5"
 
 # Menu-bar (system tray) presence. macOS-only on purpose: the Menu Bar Icon
 # asset is a macOS-style template, and gating to macOS avoids pulling the
 # gtk/libxdo stack that tray-icon needs on Linux.
+#
+# Finder "Open With" support (src/macos_open.rs). winit owns the
+# NSApplicationDelegate but doesn't implement application:openURLs:, so during
+# applicationWillFinishLaunching (observed via NSNotificationCenter, which fires
+# before AppKit dispatches the launch document) we add that method to winit's
+# delegate class at runtime (class_addMethod). objc2* are already in the tree
+# via tray-icon.
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = "0.24"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSString",
+    "NSURL",
+    "NSNotification",
+    "NSOperation",
+    "block2",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

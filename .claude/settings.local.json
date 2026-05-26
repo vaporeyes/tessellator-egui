@@ -15,7 +15,24 @@
       "Bash(RUST_BACKTRACE=full timeout 5 /Users/jsh/dev/projects/tessellator-egui/target/release/tessellator-egui)",
       "Bash(cargo tree *)",
       "Read(//Users/jsh/Downloads/tessellator-icons/**)",
-      "Bash(sips -g pixelWidth -g pixelHeight /Users/jsh/Downloads/tessellator-icons/*.png)"
+      "Bash(sips -g pixelWidth -g pixelHeight /Users/jsh/Downloads/tessellator-icons/*.png)",
+      "Bash(cargo fetch *)",
+      "Read(//private/tmp/**)",
+      "Bash(magick -size 64x48 gradient:red-blue test.jp2)",
+      "Bash(magick identify *)",
+      "Bash(./scripts/install-macos.sh)",
+      "Bash(rm -f /tmp/tess_ae_debug.log)",
+      "Bash(pkill -x tessellator-egui)",
+      "Bash(magick -size 48x48 xc:firebrick /tmp/cold/brick.jpg)",
+      "Bash(open -a Tessellator /tmp/cold/brick.jpg)",
+      "Bash(rm -f /tmp/tess_ae_debug.log /tmp/cold/brick.jpg)",
+      "Bash(rmdir /tmp/cold)",
+      "Bash(cargo add *)",
+      "Bash(mkdir -p /tmp/comic_src)",
+      "Read(//tmp/**)",
+      "Bash(magick -size 60x80 xc:red 01.jpg)",
+      "Bash(magick -size 60x80 xc:green 02.jpg)",
+      "Bash(magick -size 60x80 xc:blue 03.png)"
     ]
   }
 }

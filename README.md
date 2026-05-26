@@ -51,18 +51,35 @@ To enable verbose logging:
 RUST_LOG=debug cargo run --release
 ```
 
-### macOS app bundle
+### Install on macOS (Finder "Open With")
 
-To produce a distributable `Tessellator.app` with the Finder/Dock icon:
+To install Tessellator as a real `.app` and register it as an image handler so
+you can right-click an image and choose **Open With -> Tessellator**:
 
 ```sh
-cargo install cargo-bundle
-cargo bundle --release
+./scripts/install-macos.sh
 ```
+
+This builds release, assembles `Tessellator.app` (icon + `Info.plist` with file
+associations for JPEG, PNG, TIFF, BMP, WebP, JPEG 2000, and comic archives
+`.cbz`/`.cbr`), installs it to
+`/Applications` (or `~/Applications` if that isn't writable), ad-hoc signs it,
+and registers it with Launch Services. To make it the default viewer: Get Info
+on an image, set "Open with" to Tessellator, and click "Change All".
+
+Opening a file (via Finder, `open -a Tessellator photo.jpg`, or
+`tessellator photo.jpg`) opens that image's folder and selects it. On macOS,
+"Open With" is delivered to the app delegate's `application:openURLs:`. winit
+owns the delegate and doesn't implement that method, so `src/macos_open.rs`
+adds it to winit's delegate class at runtime - during an
+`applicationWillFinishLaunching` notification, the one moment after winit has
+set its delegate but before AppKit dispatches the launch document. On
+Windows/Linux the path arrives via argv.
 
 The bundle icon comes from `assets/Tessellator.icns`. To regenerate it after
 changing `assets/app_icon.png`, build an `.iconset` of the standard sizes and
-run `iconutil -c icns`.
+run `iconutil -c icns`. (`cargo bundle` also produces a basic `.app` but cannot
+emit the file associations, which is why the script hand-builds the bundle.)
 
 ## Keyboard shortcuts
 
@@ -150,7 +167,15 @@ Erasing every stroke or clicking the **Clear** button deletes the annotation sid
 
 ## Supported formats
 
-JPEG, PNG, WebP, BMP, TIFF. (Driven by the `image` crate.)
+JPEG, PNG, WebP, BMP, TIFF (driven by the `image` crate), and JPEG 2000
+(`.jp2`, `.j2k`, `.jpf`, `.jpx`, `.j2c`, `.jpc`) via the pure-Rust `jpeg2k`
+(`openjp2`) decoder.
+
+Comic archives: `.cbz` (ZIP, via the pure-Rust `zip` crate) and `.cbr` (RAR,
+via the bundled `unrar` C library). Open one (Finder "Open With", drag-and-drop,
+or a recent entry) and its image pages are extracted to a temp folder and shown
+in archive order, navigable like any folder of images. Archives are *entered*
+on open - they don't appear as entries inside regular folder listings.
 
 ## Configuration
 

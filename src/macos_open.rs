@@ -38,6 +38,14 @@ pub fn take_pending() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Non-draining check used at startup to decide whether to restore the last
+/// session. When the user cold-launches the app by opening a file in Finder
+/// (or via argv), the launch path is already queued by the time `App::new`
+/// runs and we should not auto-reopen the previous folder or comic.
+pub fn has_pending() -> bool {
+    PENDING.lock().map(|q| !q.is_empty()).unwrap_or(false)
+}
+
 /// Register the egui context used to wake the window when files arrive while
 /// the app is idle. Call once from `App::new`.
 pub fn register_repaint(ctx: egui::Context) {

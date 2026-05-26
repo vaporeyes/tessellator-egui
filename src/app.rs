@@ -324,6 +324,10 @@ pub struct TessellatorApp {
     archive_temp: Option<PathBuf>,
     /// True while a comic archive is extracting in the background.
     archive_loading: bool,
+    /// Bumped on every open_archive (and every open_folder that supersedes a
+    /// pending extract). The worker thread carries the generation it was
+    /// dispatched with and the ArchiveExtracted handler discards stale results.
+    archive_generation: u64,
     /// On the next FilesFound, select the first page (used when entering a comic).
     pending_select_first: bool,
 }
@@ -486,14 +490,23 @@ impl TessellatorApp {
             current_archive: None,
             archive_temp: None,
             archive_loading: false,
+            archive_generation: 0,
             pending_select_first: false,
         };
 
         // Reopen the last comic archive if there was one, else the last folder.
-        if let Some(archive) = saved.archive_path.filter(|p| p.is_file()) {
-            app.open_archive(archive, &cc.egui_ctx);
-        } else if let Some(path) = saved.folder_path.filter(|p| p.is_dir()) {
-            app.open_folder(path, &cc.egui_ctx);
+        // Skip this when the user cold-launched by opening a file in Finder
+        // (or via argv): the launch path is already queued and `handle_open_files`
+        // will service it on the first frame. Restoring the previous session
+        // would race the user's explicit open. Comic-archive restores in
+        // particular complete asynchronously and would clobber the Finder file
+        // after it has already loaded.
+        if !crate::macos_open::has_pending() {
+            if let Some(archive) = saved.archive_path.filter(|p| p.is_file()) {
+                app.open_archive(archive, &cc.egui_ctx);
+            } else if let Some(path) = saved.folder_path.filter(|p| p.is_dir()) {
+                app.open_folder(path, &cc.egui_ctx);
+            }
         }
 
         // Re-apply persisted window mode on startup so a relaunch keeps the
@@ -520,6 +533,11 @@ impl TessellatorApp {
     /// Open an ordinary folder: exit any comic archive, record it in recents,
     /// and load it. Use this for user-picked folders, drops, and recents.
     fn open_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // Invalidate any in-flight comic extraction so its delayed
+        // ArchiveExtracted message can't revert us back into the comic after
+        // we've started loading this folder.
+        self.archive_generation = self.archive_generation.wrapping_add(1);
+        self.archive_loading = false;
         self.exit_archive_mode();
         self.push_recent_folder(path.clone());
         self.load_folder(path, ctx);
@@ -537,6 +555,8 @@ impl TessellatorApp {
     /// and persistence track the archive itself, not the temp folder.
     fn open_archive(&mut self, archive: PathBuf, ctx: &egui::Context) {
         self.last_load_error = None;
+        self.archive_generation = self.archive_generation.wrapping_add(1);
+        let generation = self.archive_generation;
         self.archive_loading = true;
         let sender = self.sender.clone();
         let ctx = ctx.clone();
@@ -544,7 +564,11 @@ impl TessellatorApp {
         // and off Rayon's pool (matching the folder-scan pattern).
         std::thread::spawn(move || {
             let result = crate::archive::extract_to_temp(&archive);
-            let _ = sender.send(Message::ArchiveExtracted { archive, result });
+            let _ = sender.send(Message::ArchiveExtracted {
+                archive,
+                result,
+                generation,
+            });
             ctx.request_repaint();
         });
     }
@@ -1130,7 +1154,9 @@ impl TessellatorApp {
     /// filter is off this is just `0..files.len()`.
     fn visible_indices(&self) -> Vec<usize> {
         let query = self.filter_query.trim().to_lowercase();
-        let ext_filter = query.strip_prefix('.').map(|s| s.to_string());
+        // Pre-format the dotted extension once instead of per-file inside the
+        // filter closure.
+        let ext_suffix = query.strip_prefix('.').map(|s| format!(".{}", s));
         self.files
             .iter()
             .enumerate()
@@ -1140,8 +1166,8 @@ impl TessellatorApp {
                 }
                 if !query.is_empty() {
                     let name_lc = f.name.to_lowercase();
-                    return match &ext_filter {
-                        Some(ext) => name_lc.ends_with(&format!(".{}", ext)),
+                    return match &ext_suffix {
+                        Some(suffix) => name_lc.ends_with(suffix),
                         None => name_lc.contains(&query),
                     };
                 }
@@ -1544,7 +1570,25 @@ impl TessellatorApp {
                         }
                     }
                 }
-                Message::ArchiveExtracted { archive, result } => {
+                Message::ArchiveExtracted {
+                    archive,
+                    result,
+                    generation,
+                } => {
+                    // A newer open (folder, file, or different archive) has
+                    // superseded this extraction. Drop the temp pages on the
+                    // floor rather than reverting the user's current view.
+                    if generation != self.archive_generation {
+                        log::debug!(
+                            "Discarding stale ArchiveExtracted (gen {} != {})",
+                            generation,
+                            self.archive_generation
+                        );
+                        if let Ok(temp) = result {
+                            let _ = std::fs::remove_dir_all(&temp);
+                        }
+                        continue;
+                    }
                     self.archive_loading = false;
                     match result {
                         Ok(temp) => {
@@ -1590,11 +1634,16 @@ impl TessellatorApp {
             return;
         };
         // Pin selection to the current file so the scan resolves it back
-        // when the new file list arrives.
-        self.restore_selection = self
-            .selected_index
-            .and_then(|i| self.files.get(i))
-            .map(|f| f.path.clone());
+        // when the new file list arrives. Preserve any restore_selection a
+        // caller already set (e.g. rename, or a Finder open whose scan is
+        // still pending) - otherwise a watcher debounce that fires between
+        // open_folder() and the matching FilesFound clobbers the target.
+        if self.restore_selection.is_none() {
+            self.restore_selection = self
+                .selected_index
+                .and_then(|i| self.files.get(i))
+                .map(|f| f.path.clone());
+        }
         // The new file list will repopulate these. We keep image_cache,
         // pending_image_requests, current_image / current_image_path so
         // navigation back to recently-viewed images stays instant.
