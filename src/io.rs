@@ -215,6 +215,28 @@ fn is_jpeg(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xFF, 0xD8, 0xFF])
 }
 
+/// JPEG 2000 detection by magic bytes: the JP2/JPX/JPM signature box, or a
+/// raw J2K codestream. The `image` crate decodes neither, so these route to
+/// the jpeg2k decoder (pure-Rust openjp2 backend) instead.
+fn is_jp2(bytes: &[u8]) -> bool {
+    // JP2 family signature box: length 0x0C, type "jP  ", then the 0D 0A 87 0A
+    // marker. Covers .jp2/.jpx/.jpf/.jpm containers.
+    const JP2_SIGNATURE: &[u8] = &[
+        0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+    ];
+    // Bare J2K codestream start-of-codestream marker (.j2k/.j2c/.jpc).
+    const J2K_CODESTREAM: &[u8] = &[0xFF, 0x4F, 0xFF, 0x51];
+    bytes.starts_with(JP2_SIGNATURE) || bytes.starts_with(J2K_CODESTREAM)
+}
+
+/// Decode a JPEG 2000 image (JP2 container or raw J2K codestream) to a
+/// DynamicImage via jpeg2k. JPEG 2000 carries no EXIF orientation, so callers
+/// apply no transform.
+fn decode_jp2_from_bytes(slice: &[u8]) -> Option<DynamicImage> {
+    let jp2 = jpeg2k::Image::from_bytes(slice).ok()?;
+    DynamicImage::try_from(&jp2).ok()
+}
+
 /// Fast-path JPEG decode that uses libjpeg-style DCT scaling. For a 24MP
 /// source and a 128 px thumbnail target this is roughly 64x faster than
 /// decoding the full raster. Returns `None` for non-RGB/L8 pixel formats
@@ -557,6 +579,15 @@ fn average_color(pixels: &[[u8; 3]]) -> [u8; 3] {
 /// File contents are loaded via memory-mapped I/O when possible, avoiding the
 /// page-cache → user-space copy that the standard `BufReader` path triggers.
 fn decode_image_from_bytes(slice: &[u8]) -> image::ImageResult<DynamicImage> {
+    // JPEG 2000 isn't handled by the image crate; route it to jpeg2k.
+    if is_jp2(slice) {
+        return decode_jp2_from_bytes(slice).ok_or_else(|| {
+            image::ImageError::Decoding(image::error::DecodingError::new(
+                image::error::ImageFormatHint::Name("JPEG 2000".to_string()),
+                "jpeg2k failed to decode JPEG 2000 image",
+            ))
+        });
+    }
     let cursor = Cursor::new(slice);
     let reader = image::ImageReader::new(cursor)
         .with_guessed_format()
@@ -716,9 +747,17 @@ pub enum Message {
         path: PathBuf,
         result: Result<(), String>,
     },
+    /// A comic archive finished extracting to a temp folder (or failed).
+    ArchiveExtracted {
+        archive: PathBuf,
+        result: Result<PathBuf, String>,
+    },
 }
 
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "webp", "bmp", "tiff", // JPEG 2000 containers and raw codestreams.
+    "jp2", "j2k", "jpf", "jpx", "j2c", "jpc",
+];
 
 pub fn is_image_file(path: &Path) -> bool {
     path.extension()
@@ -838,6 +877,15 @@ fn decode_thumbnail(path: &Path) -> Option<(DynamicImage, (u32, u32))> {
         return Some((img.thumbnail(128, 128), dims));
     }
 
+    // JPEG 2000: no DCT-style fast path, so decode fully then downsample. JP2
+    // carries no EXIF orientation, so dimensions are taken as-is.
+    if is_jp2(slice)
+        && let Some(img) = decode_jp2_from_bytes(slice)
+    {
+        let dims = (img.width(), img.height());
+        return Some((img.thumbnail(128, 128), dims));
+    }
+
     // Fallback: full decode. We've already read the bytes once via mmap, so
     // hand them straight to ImageReader instead of re-opening the file.
     let cursor = Cursor::new(slice);
@@ -940,6 +988,19 @@ mod tests {
         assert!(!is_jpeg(&[0x89, 0x50, 0x4E, 0x47]), "PNG should not match");
         assert!(!is_jpeg(&[]), "empty");
         assert!(!is_jpeg(&[0xFF, 0xD8]), "too short");
+    }
+
+    #[test]
+    fn is_jp2_magic_bytes() {
+        // JP2 signature box.
+        assert!(is_jp2(&[
+            0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+        ]));
+        // Raw J2K codestream SOC marker.
+        assert!(is_jp2(&[0xFF, 0x4F, 0xFF, 0x51]));
+        assert!(!is_jp2(&[0xFF, 0xD8, 0xFF, 0xE0]), "JPEG should not match");
+        assert!(!is_jp2(&[0x89, 0x50, 0x4E, 0x47]), "PNG should not match");
+        assert!(!is_jp2(&[]), "empty");
     }
 
     #[test]

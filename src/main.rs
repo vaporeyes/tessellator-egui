@@ -3,8 +3,10 @@
 
 mod annotation;
 mod app;
+mod archive;
 mod branding;
 mod cache;
+mod macos_open;
 mod gpu;
 mod io;
 mod pinboard;
@@ -19,6 +21,20 @@ use std::sync::Arc;
 
 fn main() -> eframe::Result {
     env_logger::init();
+
+    // Files passed on the command line (e.g. `tessellator photo.jpg`, or the
+    // Windows/Linux file-association path). Finder "Open With" does NOT use
+    // argv - it sends an Apple Event handled by the delegate installed below.
+    let arg_paths: Vec<std::path::PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+    macos_open::queue_paths(arg_paths);
+    // Register the macOS open-files handler before the event loop starts so the
+    // willFinishLaunching observer is in place for the launch document. No-op
+    // on other platforms (they receive files via argv above).
+    macos_open::install();
 
     // Request the largest 2D texture dimension the adapter advertises (M1+
     // Macs report 16384). Without this, wgpu's default 8192 cap rejects any

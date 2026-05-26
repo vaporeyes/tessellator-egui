@@ -317,6 +317,15 @@ pub struct TessellatorApp {
     branding: crate::branding::Branding,
     /// macOS menu-bar presence (no-op on other platforms).
     tray: crate::tray::TrayHost,
+    /// Source comic archive when viewing one (its pages are extracted to a temp
+    /// folder); `None` when viewing an ordinary folder.
+    current_archive: Option<PathBuf>,
+    /// Temp folder holding an open comic's extracted pages, to delete on close.
+    archive_temp: Option<PathBuf>,
+    /// True while a comic archive is extracting in the background.
+    archive_loading: bool,
+    /// On the next FilesFound, select the first page (used when entering a comic).
+    pending_select_first: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -370,6 +379,10 @@ struct PersistentState {
     compact: Option<bool>,
     #[serde(default)]
     show_only_starred: Option<bool>,
+    /// Last open comic archive, reopened (re-extracted) on launch in place of
+    /// `folder_path`. Mutually exclusive with it at save time.
+    #[serde(default)]
+    archive_path: Option<PathBuf>,
 }
 
 const RECENT_FOLDERS_MAX: usize = 8;
@@ -386,6 +399,11 @@ impl TessellatorApp {
             .storage
             .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
             .unwrap_or_default();
+
+        // Let the open-files handler wake an idle window when a file is opened
+        // via Finder "Open With" while the app is already running. (The handler
+        // itself is installed from main, before the event loop starts.)
+        crate::macos_open::register_repaint(cc.egui_ctx.clone());
 
         let mut app = Self {
             folder_path: None,
@@ -465,11 +483,16 @@ impl TessellatorApp {
             scan_cancel: None,
             branding: crate::branding::Branding::default(),
             tray: crate::tray::TrayHost::default(),
+            current_archive: None,
+            archive_temp: None,
+            archive_loading: false,
+            pending_select_first: false,
         };
 
-        if let Some(path) = saved.folder_path
-            && path.is_dir()
-        {
+        // Reopen the last comic archive if there was one, else the last folder.
+        if let Some(archive) = saved.archive_path.filter(|p| p.is_file()) {
+            app.open_archive(archive, &cc.egui_ctx);
+        } else if let Some(path) = saved.folder_path.filter(|p| p.is_dir()) {
             app.open_folder(path, &cc.egui_ctx);
         }
 
@@ -494,7 +517,42 @@ impl TessellatorApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!self.reference_mode));
     }
 
+    /// Open an ordinary folder: exit any comic archive, record it in recents,
+    /// and load it. Use this for user-picked folders, drops, and recents.
     fn open_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.exit_archive_mode();
+        self.push_recent_folder(path.clone());
+        self.load_folder(path, ctx);
+    }
+
+    /// Delete the open comic's temp pages (if any) and leave archive mode.
+    fn exit_archive_mode(&mut self) {
+        self.current_archive = None;
+        if let Some(temp) = self.archive_temp.take() {
+            let _ = std::fs::remove_dir_all(&temp);
+        }
+    }
+
+    /// Extract a comic archive in the background, then load its pages. Recents
+    /// and persistence track the archive itself, not the temp folder.
+    fn open_archive(&mut self, archive: PathBuf, ctx: &egui::Context) {
+        self.last_load_error = None;
+        self.archive_loading = true;
+        let sender = self.sender.clone();
+        let ctx = ctx.clone();
+        // I/O + decompression bound; a one-off thread keeps the UI responsive
+        // and off Rayon's pool (matching the folder-scan pattern).
+        std::thread::spawn(move || {
+            let result = crate::archive::extract_to_temp(&archive);
+            let _ = sender.send(Message::ArchiveExtracted { archive, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Load a folder's contents: reset view state, scan, and watch it. Does not
+    /// touch recents or archive state - callers (`open_folder`, the archive
+    /// handler) decide those.
+    fn load_folder(&mut self, path: PathBuf, ctx: &egui::Context) {
         // Save any pending annotation before swapping folders. Otherwise the
         // outgoing layer would be dropped on the floor.
         self.save_current_annotation();
@@ -502,7 +560,6 @@ impl TessellatorApp {
         self.annotation_path = None;
         self.annotation_needs_full_upload = false;
         self.folder_path = Some(path.clone());
-        self.push_recent_folder(path.clone());
         self.files.clear();
         self.selected_index = None;
         self.requested_thumbnails.clear();
@@ -1327,8 +1384,17 @@ impl TessellatorApp {
                     if let Some(target) = self.restore_selection.take()
                         && let Some(i) = self.files.iter().position(|f| f.path == target)
                     {
-                        self.selected_index = Some(i);
-                        self.pending_scroll_to_index = Some(i);
+                        // Go through select_image so the decode is dispatched and
+                        // the image is shown. Setting selected_index directly only
+                        // highlights the row and leaves the viewport empty.
+                        self.select_image(i, ctx);
+                    }
+                    // Entering a comic: open it on the first page.
+                    if self.pending_select_first {
+                        self.pending_select_first = false;
+                        if self.selected_index.is_none() && !self.files.is_empty() {
+                            self.select_image(0, ctx);
+                        }
                     }
                 }
                 Message::ThumbnailLoaded {
@@ -1475,6 +1541,25 @@ impl TessellatorApp {
                         }
                         Err(e) => {
                             self.last_load_error = Some(format!("Export failed: {}", e));
+                        }
+                    }
+                }
+                Message::ArchiveExtracted { archive, result } => {
+                    self.archive_loading = false;
+                    match result {
+                        Ok(temp) => {
+                            // Clean up any previously open comic, then enter the
+                            // new one. Recents/persistence track the archive,
+                            // not the temp pages.
+                            self.exit_archive_mode();
+                            self.current_archive = Some(archive.clone());
+                            self.archive_temp = Some(temp.clone());
+                            self.push_recent_folder(archive);
+                            self.pending_select_first = true;
+                            self.load_folder(temp, ctx);
+                        }
+                        Err(e) => {
+                            self.last_load_error = Some(format!("Could not open comic: {e}"));
                         }
                     }
                 }
@@ -1659,14 +1744,36 @@ impl TessellatorApp {
         if dropped.is_empty() {
             return;
         }
-        for file in dropped {
-            let Some(path) = file.path else { continue };
+        let paths = dropped.into_iter().filter_map(|f| f.path).collect();
+        self.open_path_list(paths, ctx);
+    }
+
+    /// Resolve files handed to us by Finder "Open With" (or argv). Same
+    /// behavior as a drop: a file selects within its folder, a folder opens.
+    fn handle_open_files(&mut self, ctx: &egui::Context) {
+        let paths = crate::macos_open::take_pending();
+        if paths.is_empty() {
+            return;
+        }
+        self.open_path_list(paths, ctx);
+    }
+
+    /// Open the first usable path in `paths`: a directory opens directly, a
+    /// file opens its parent directory and is selected once the scan lands.
+    fn open_path_list(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        for path in paths {
+            // A comic archive is entered (extracted + paged), not opened as a
+            // file in its parent folder.
+            if crate::archive::is_archive_file(&path) && path.is_file() {
+                self.open_archive(path, ctx);
+                return;
+            }
             let (folder, target) = if path.is_dir() {
                 (Some(path), None)
             } else if path.is_file() {
                 let parent = path.parent().map(|p| p.to_path_buf());
-                // Stash the dropped file's path so the next FilesFound
-                // handler selects it after the scan completes.
+                // Stash the file's path so the next FilesFound handler selects
+                // it after the scan completes.
                 (parent, Some(path))
             } else {
                 (None, None)
@@ -1682,6 +1789,15 @@ impl TessellatorApp {
     }
 }
 
+impl Drop for TessellatorApp {
+    fn drop(&mut self) {
+        // Best-effort removal of an open comic's extracted pages on exit.
+        if let Some(temp) = self.archive_temp.take() {
+            let _ = std::fs::remove_dir_all(&temp);
+        }
+    }
+}
+
 impl eframe::App for TessellatorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.tray.update(ui.ctx());
@@ -1691,11 +1807,15 @@ impl eframe::App for TessellatorApp {
         self.drain_messages(ui.ctx());
         self.process_folder_refresh(ui.ctx());
         self.handle_dropped_files(ui.ctx());
+        self.handle_open_files(ui.ctx());
         self.handle_keyboard_nav(ui.ctx());
         // Compact mode strips chrome down to just the viewport, for a clean
         // floating reference. Reference mode (`T`) controls always-on-top
         // and OS decorations independently.
         if !self.compact {
+            // Top menu bar first so it claims the top strip before the side
+            // and central panels.
+            self.show_menu_bar(ui);
             self.show_sidebar(ui);
             self.show_status_bar(ui);
         }
@@ -1714,8 +1834,14 @@ impl eframe::App for TessellatorApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // In a comic, `folder_path` is a temp dir that won't exist next launch,
+        // so persist the archive instead and reopen (re-extract) it.
+        let (folder_path, archive_path) = match &self.current_archive {
+            Some(archive) => (None, Some(archive.clone())),
+            None => (self.folder_path.clone(), None),
+        };
         let state = PersistentState {
-            folder_path: self.folder_path.clone(),
+            folder_path,
             recursion_depth: Some(self.recursion_depth),
             overlay_mode: Some(self.overlay_mode),
             overlay_opacity: Some(self.overlay_opacity),
@@ -1741,12 +1867,130 @@ impl eframe::App for TessellatorApp {
             reference_mode: Some(self.reference_mode),
             compact: Some(self.compact),
             show_only_starred: Some(self.show_only_starred),
+            archive_path,
         };
         eframe::set_value(storage, eframe::APP_KEY, &state);
     }
 }
 
 impl TessellatorApp {
+    /// Top menu bar. File operations live here (open folder/file, recents,
+    /// rename/trash/export) rather than scattered as buttons. Closures only
+    /// touch locals - results are applied after, so `self` isn't borrowed
+    /// inside egui's nested menu closures.
+    fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
+        let recents = self.recent_folders.clone();
+        let has_selection = self.selected_index.is_some();
+        let has_image = self.current_image.is_some();
+
+        let mut to_open: Option<PathBuf> = None;
+        let mut about = false;
+        let mut do_rename = false;
+        let mut do_trash = false;
+        let mut do_export = false;
+
+        egui::Panel::top("menu_bar").show_inside(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui
+                        .button("Open Folder...")
+                        .on_hover_text(format!("Open a folder of images ({OPEN_SHORTCUT_LABEL})"))
+                        .clicked()
+                    {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            to_open = Some(p);
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .button("Open File...")
+                        .on_hover_text("Open a single image or comic archive (.cbz/.cbr)")
+                        .clicked()
+                    {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter(
+                                "Images & Comics",
+                                &[
+                                    "jpg", "jpeg", "png", "webp", "bmp", "tiff", "jp2", "j2k",
+                                    "jpf", "jpx", "j2c", "jpc", "cbz", "cbr",
+                                ],
+                            )
+                            .pick_file()
+                        {
+                            to_open = Some(p);
+                        }
+                        ui.close();
+                    }
+                    ui.menu_button("Open Recent", |ui| {
+                        if recents.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("(none)"));
+                        }
+                        for path in &recents {
+                            let label = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.display().to_string());
+                            if ui
+                                .button(label)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                to_open = Some(path.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Rename..."))
+                        .clicked()
+                    {
+                        do_rename = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_selection, egui::Button::new("Move to Trash"))
+                        .clicked()
+                    {
+                        do_trash = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_image, egui::Button::new("Export..."))
+                        .clicked()
+                    {
+                        do_export = true;
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About Tessellator").clicked() {
+                        about = true;
+                        ui.close();
+                    }
+                });
+            });
+        });
+
+        // Apply outside the menu closures, where `self` is free to borrow.
+        if about {
+            self.branding.about_open = true;
+        }
+        if do_rename {
+            self.rename_selected(ui.ctx());
+        }
+        if do_trash {
+            self.delete_selected_to_trash(ui.ctx());
+        }
+        if do_export {
+            self.trigger_export();
+        }
+        if let Some(path) = to_open {
+            // open_path_list routes folders, comic archives, and single images.
+            self.open_path_list(vec![path], ui.ctx());
+        }
+    }
+
     fn show_sidebar(&mut self, ui: &mut egui::Ui) {
         let mut clicked: Option<usize> = None;
         let mut to_request: Vec<PathBuf> = Vec::new();
@@ -1758,49 +2002,34 @@ impl TessellatorApp {
             .resizable(true)
             .default_size(250.0)
             .show_inside(ui, |ui| {
+                ui.heading("Tessellator");
+                ui.add_space(4.0);
+
+                // Primary quick action. Recent files and other file operations
+                // live in the top File menu.
+                let btn = ui
+                    .add_sized(
+                        [ui.available_width(), 26.0],
+                        egui::Button::new("Open Folder..."),
+                    )
+                    .on_hover_text(format!("Open folder ({})", OPEN_SHORTCUT_LABEL));
+                if btn.clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    open_folder = Some(path);
+                }
+
+                // Scan depth: a niche folder-scan setting, on its own line so it
+                // doesn't crowd the open actions.
                 ui.horizontal(|ui| {
-                    ui.heading("Tessellator");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("About")
-                            .on_hover_text("About Tessellator")
-                            .clicked()
-                        {
-                            self.branding.about_open = true;
-                        }
-                    });
-                });
-                ui.horizontal(|ui| {
-                    let btn = ui
-                        .button("Open Folder...")
-                        .on_hover_text(format!("Open folder ({})", OPEN_SHORTCUT_LABEL));
-                    if btn.clicked()
-                        && let Some(path) = rfd::FileDialog::new().pick_folder()
-                    {
-                        open_folder = Some(path);
-                    }
-                    if !self.recent_folders.is_empty() {
-                        ui.menu_button("Recent", |ui| {
-                            for path in self.recent_folders.clone() {
-                                let label = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| path.display().to_string());
-                                let resp =
-                                    ui.button(label).on_hover_text(path.display().to_string());
-                                if resp.clicked() {
-                                    open_folder = Some(path);
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                    ui.label("Depth:");
-                    let r = ui.add(
-                        egui::DragValue::new(&mut self.recursion_depth)
-                            .range(1..=16)
-                            .speed(0.1),
-                    );
+                    ui.label("Scan depth:");
+                    let r = ui
+                        .add(
+                            egui::DragValue::new(&mut self.recursion_depth)
+                                .range(1..=16)
+                                .speed(0.1),
+                        )
+                        .on_hover_text("Subfolder levels to include when scanning");
                     // Trigger a rescan only on commit (lost focus or Enter),
                     // not while typing - otherwise typing "10" rescans at
                     // "1" and again at "10".
@@ -1808,12 +2037,10 @@ impl TessellatorApp {
                         depth_changed = true;
                     }
                 });
-                ui.horizontal(|ui| {
-                    let starred_count = self.files.iter().filter(|f| f.starred).count();
-                    ui.checkbox(&mut self.show_only_starred, "Starred only")
-                        .on_hover_text("Filter to favourites (Shift+S)");
-                    ui.label(format!("({}/{})", starred_count, self.files.len()));
-                });
+
+                ui.separator();
+
+                // Filter group: search + starred-only, kept together.
                 ui.horizontal(|ui| {
                     ui.label("Search:");
                     let resp = ui.add(
@@ -1830,6 +2057,18 @@ impl TessellatorApp {
                             self.pending_scroll_to_index = Some(i);
                         }
                     }
+                });
+                ui.horizontal(|ui| {
+                    let starred_count = self.files.iter().filter(|f| f.starred).count();
+                    ui.checkbox(&mut self.show_only_starred, "Starred only")
+                        .on_hover_text("Filter to favourites (Shift+S)");
+                    // Count, right-aligned and de-emphasized.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} / {}", starred_count, self.files.len()))
+                                .weak(),
+                        );
+                    });
                 });
                 ui.separator();
 
@@ -1990,7 +2229,12 @@ impl TessellatorApp {
             });
 
         if let Some(path) = open_folder {
-            self.open_folder(path, ui.ctx());
+            // Recents can include comic archives; route those to open_archive.
+            if crate::archive::is_archive_file(&path) {
+                self.open_archive(path, ui.ctx());
+            } else {
+                self.open_folder(path, ui.ctx());
+            }
         } else if depth_changed && let Some(path) = self.folder_path.clone() {
             // Re-scan with the new depth.
             self.open_folder(path, ui.ctx());
@@ -2022,239 +2266,242 @@ impl TessellatorApp {
     fn show_settings_controls(&mut self, ui: &mut egui::Ui) {
         self.show_tool_icons(ui);
         ui.separator();
-        egui::Grid::new("settings_list")
-            .num_columns(2)
-            .striped(true)
-            .spacing(egui::vec2(14.0, 6.0))
+
+        // A 2-column grid builder reused per collapsible section so each group
+        // lays out label/control pairs consistently.
+        let grid = |id: &str| {
+            egui::Grid::new(id)
+                .num_columns(2)
+                .striped(true)
+                .spacing(egui::vec2(14.0, 6.0))
+        };
+
+        // Image adjustments (tone / value / render).
+        egui::CollapsingHeader::new("Image")
+            .default_open(true)
             .show(ui, |ui| {
-                settings_row(ui, "Grayscale:", |ui| {
-                    ui.add_sized(
-                        egui::vec2(180.0, 0.0),
-                        egui::Slider::new(&mut self.grayscale, 0.0..=1.0),
-                    );
-                });
-
-                settings_row(ui, "Values:", |ui| {
-                    ui.checkbox(&mut self.value_study, "Enabled")
-                        .on_hover_text("Posterize to N bands for value study (V)");
-                    if self.value_study {
-                        ui.add(egui::Slider::new(&mut self.value_levels, 2..=8).text("bands"));
-                    }
-                });
-
-                settings_row(ui, "Transform:", |ui| {
-                    ui.checkbox(&mut self.flip_h, "Flip H")
-                        .on_hover_text("Mirror horizontally to spot composition issues (H)");
-                    if ui
-                        .button(format!(
-                            "Rotate {}",
-                            ["0°", "90°", "180°", "270°"][self.manual_rotation as usize]
-                        ))
-                        .on_hover_text("Rotate clockwise (R) - hold Shift to go counter-clockwise")
-                        .clicked()
-                    {
-                        self.manual_rotation = (self.manual_rotation + 1) & 3;
-                    }
-                });
-
-                settings_row(ui, "Crop:", |ui| {
-                    egui::ComboBox::from_id_salt("crop_ratio")
-                        .selected_text(self.crop_ratio.label())
-                        .show_ui(ui, |ui| {
-                            for r in [
-                                CropRatio::None,
-                                CropRatio::Square,
-                                CropRatio::FourFive,
-                                CropRatio::SixteenNine,
-                                CropRatio::Golden,
-                            ] {
-                                ui.selectable_value(&mut self.crop_ratio, r, r.label());
-                            }
-                        });
-                });
-
-                settings_row(ui, "Annotate:", |ui| {
-                    ui.toggle_value(&mut self.annotating, "Enabled")
-                        .on_hover_text(
-                            "Drag to paint over the image; strokes save to a sidecar PNG (A)",
+                grid("settings_image").show(ui, |ui| {
+                    settings_row(ui, "Grayscale:", |ui| {
+                        ui.add_sized(
+                            egui::vec2(180.0, 0.0),
+                            egui::Slider::new(&mut self.grayscale, 0.0..=1.0),
                         );
-                    if self.annotating {
-                        ui.color_edit_button_rgb(&mut self.brush_color);
-                        ui.add(egui::Slider::new(&mut self.brush_radius, 1.0..=200.0).text("px"));
-                        ui.toggle_value(&mut self.erasing, "Erase");
-                        if ui
-                            .button("Clear")
-                            .on_hover_text("Remove all strokes and delete the sidecar PNG")
-                            .clicked()
-                        {
-                            self.remove_current_annotation();
-                        }
-                    }
-                });
+                    });
 
-                settings_row(ui, "Overlay:", |ui| {
-                    egui::ComboBox::from_id_salt("overlay_mode")
-                        .selected_text(self.overlay_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in [
-                                OverlayMode::None,
-                                OverlayMode::Grid,
-                                OverlayMode::RuleOfThirds,
-                                OverlayMode::GoldenRatio,
-                                OverlayMode::Diagonal,
-                            ] {
-                                ui.selectable_value(&mut self.overlay_mode, mode, mode.label());
-                            }
-                        });
-                    if self.overlay_mode != OverlayMode::None {
-                        ui.add(
-                            egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0)
-                                .text("Opacity"),
+                    settings_row(ui, "Values:", |ui| {
+                        ui.checkbox(&mut self.value_study, "Enabled")
+                            .on_hover_text("Posterize to N bands for value study (V)");
+                        if self.value_study {
+                            ui.add(egui::Slider::new(&mut self.value_levels, 2..=8).text("bands"));
+                        }
+                    });
+
+                    settings_row(ui, "Render:", |ui| {
+                        ui.checkbox(&mut self.dither, "Dither")
+                            .on_hover_text("Add 1-bit noise to remove gradient banding");
+                        ui.checkbox(&mut self.clipping_warning, "Clip").on_hover_text(
+                            "Highlight clipped pixels - magenta = blown highlights, cyan = crushed shadows",
                         );
-                        if self.overlay_mode == OverlayMode::Grid {
-                            ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0).text("Size"));
-                        }
-                    }
+                    });
                 });
+            });
 
-                settings_row(ui, "Grid:", |ui| {
-                    let mut show_grid = self.overlay_mode == OverlayMode::Grid;
-                    if ui
-                        .checkbox(&mut show_grid, "Show")
-                        .on_hover_text("Show the composition grid overlay")
-                        .changed()
-                    {
-                        self.overlay_mode = if show_grid {
-                            OverlayMode::Grid
-                        } else {
-                            OverlayMode::None
-                        };
-                    }
-                    if self.overlay_mode == OverlayMode::Grid {
-                        ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0).text("Size"));
-                        ui.add(
-                            egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0)
-                                .text("Opacity"),
-                        );
-                    }
-                });
-
-                settings_row(ui, "View:", |ui| {
-                    if ui
-                        .button("Fit")
-                        .on_hover_text("Fit image to viewport (F)")
-                        .clicked()
-                    {
-                        self.view = ViewState::FitOnNextFrame;
-                    }
-                    if ui
-                        .button("Fill")
-                        .on_hover_text("Fill viewport, may crop (Shift+F)")
-                        .clicked()
-                    {
-                        self.view = ViewState::FillOnNextFrame;
-                    }
-                    if ui
-                        .button("100%")
-                        .on_hover_text("Display at native pixel size (1)")
-                        .clicked()
-                    {
-                        self.view = ViewState::one_to_one();
-                    }
-                });
-
-                settings_row(ui, "Compare:", |ui| {
-                    self.show_compare_controls(ui);
-                });
-
-                settings_row(ui, "Image Grid:", |ui| {
-                    self.show_grid_controls(ui);
-                });
-
-                settings_row(ui, "Render:", |ui| {
-                    ui.checkbox(&mut self.dither, "Dither")
-                        .on_hover_text("Add 1-bit noise to remove gradient banding");
-                    ui.checkbox(&mut self.clipping_warning, "Clip").on_hover_text(
-                        "Highlight clipped pixels - magenta = blown highlights, cyan = crushed shadows",
-                    );
-                });
-
-                settings_row(ui, "Panels:", |ui| {
-                    ui.checkbox(&mut self.show_histogram, "Histogram")
-                        .on_hover_text("RGB + luminance histogram overlay");
-                    ui.checkbox(&mut self.show_exif, "EXIF")
-                        .on_hover_text("Camera, lens, and capture settings panel");
-                    ui.toggle_value(&mut self.show_color_panel, "Color...")
-                        .on_hover_text("Open palette + split-tone controls")
-                        .clicked();
-                });
-
-                settings_row(ui, "Window:", |ui| {
-                    let prev_ref = self.reference_mode;
-                    ui.toggle_value(&mut self.reference_mode, "On top")
-                        .on_hover_text("Always-on-top + borderless (T)");
-                    if self.reference_mode != prev_ref {
-                        self.apply_reference_mode(ui.ctx());
-                    }
-                    ui.toggle_value(&mut self.compact, "Compact")
-                        .on_hover_text("Hide all panels - just the image (\\)");
-                });
-
-                settings_row(ui, "Pinboard:", |ui| {
-                    ui.toggle_value(&mut self.pinboard_mode, "Enabled")
-                        .on_hover_text("Moodboard canvas - drag, resize, arrange (P)");
-                    if self.pinboard_mode
-                        && ui
-                            .button("Pin selected")
-                            .on_hover_text("Add the current image to the pinboard (B)")
-                            .clicked()
-                    {
-                        self.pin_selected_to_board();
-                    }
-                });
-
-                if self.selected_index.is_some() {
-                    settings_row(ui, "File:", |ui| {
+        // Composition aids (framing, overlays, transforms).
+        egui::CollapsingHeader::new("Composition")
+            .default_open(true)
+            .show(ui, |ui| {
+                grid("settings_compose").show(ui, |ui| {
+                    settings_row(ui, "Transform:", |ui| {
+                        ui.checkbox(&mut self.flip_h, "Flip H")
+                            .on_hover_text("Mirror horizontally to spot composition issues (H)");
                         if ui
-                            .button("Rename...")
-                            .on_hover_text("Rename the current image (sidecars follow)")
+                            .button(format!(
+                                "Rotate {}",
+                                ["0°", "90°", "180°", "270°"][self.manual_rotation as usize]
+                            ))
+                            .on_hover_text(
+                                "Rotate clockwise (R) - hold Shift to go counter-clockwise",
+                            )
                             .clicked()
                         {
-                            self.rename_selected(ui.ctx());
+                            self.manual_rotation = (self.manual_rotation + 1) & 3;
                         }
-                        if ui
-                            .button("Trash")
-                            .on_hover_text("Send the current image to the OS trash (Cmd+Delete)")
-                            .clicked()
-                        {
-                            self.delete_selected_to_trash(ui.ctx());
-                        }
-                        if self.current_image.is_some()
-                            && ui
-                                .button("Export...")
-                                .on_hover_text(
-                                    "Render the image with current effects to a new JPEG/PNG",
-                                )
-                                .clicked()
-                        {
-                            let default_name = self
-                                .current_image_path
-                                .as_ref()
-                                .and_then(|p| p.file_stem())
-                                .map(|s| format!("{}_export.png", s.to_string_lossy()))
-                                .unwrap_or_else(|| "export.png".to_string());
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("PNG", &["png"])
-                                .add_filter("JPEG", &["jpg", "jpeg"])
-                                .set_file_name(default_name)
-                                .save_file()
-                            {
-                                self.pending_export = Some(path);
+                    });
+
+                    settings_row(ui, "Crop:", |ui| {
+                        egui::ComboBox::from_id_salt("crop_ratio")
+                            .selected_text(self.crop_ratio.label())
+                            .show_ui(ui, |ui| {
+                                for r in [
+                                    CropRatio::None,
+                                    CropRatio::Square,
+                                    CropRatio::FourFive,
+                                    CropRatio::SixteenNine,
+                                    CropRatio::Golden,
+                                ] {
+                                    ui.selectable_value(&mut self.crop_ratio, r, r.label());
+                                }
+                            });
+                    });
+
+                    settings_row(ui, "Overlay:", |ui| {
+                        egui::ComboBox::from_id_salt("overlay_mode")
+                            .selected_text(self.overlay_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    OverlayMode::None,
+                                    OverlayMode::Grid,
+                                    OverlayMode::RuleOfThirds,
+                                    OverlayMode::GoldenRatio,
+                                    OverlayMode::Diagonal,
+                                ] {
+                                    ui.selectable_value(&mut self.overlay_mode, mode, mode.label());
+                                }
+                            });
+                        if self.overlay_mode != OverlayMode::None {
+                            ui.add(
+                                egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0)
+                                    .text("Opacity"),
+                            );
+                            if self.overlay_mode == OverlayMode::Grid {
+                                ui.add(
+                                    egui::Slider::new(&mut self.grid_size, 1.0..=50.0).text("Size"),
+                                );
                             }
                         }
                     });
-                }
+
+                    settings_row(ui, "Grid:", |ui| {
+                        let mut show_grid = self.overlay_mode == OverlayMode::Grid;
+                        if ui
+                            .checkbox(&mut show_grid, "Show")
+                            .on_hover_text("Show the composition grid overlay")
+                            .changed()
+                        {
+                            self.overlay_mode = if show_grid {
+                                OverlayMode::Grid
+                            } else {
+                                OverlayMode::None
+                            };
+                        }
+                        if self.overlay_mode == OverlayMode::Grid {
+                            ui.add(egui::Slider::new(&mut self.grid_size, 1.0..=50.0).text("Size"));
+                            ui.add(
+                                egui::Slider::new(&mut self.overlay_opacity, 0.0..=1.0)
+                                    .text("Opacity"),
+                            );
+                        }
+                    });
+                });
             });
+
+        // View, A/B compare, and multi-image grid.
+        egui::CollapsingHeader::new("View & Compare")
+            .default_open(true)
+            .show(ui, |ui| {
+                grid("settings_view").show(ui, |ui| {
+                    settings_row(ui, "View:", |ui| {
+                        if ui
+                            .button("Fit")
+                            .on_hover_text("Fit image to viewport (F)")
+                            .clicked()
+                        {
+                            self.view = ViewState::FitOnNextFrame;
+                        }
+                        if ui
+                            .button("Fill")
+                            .on_hover_text("Fill viewport, may crop (Shift+F)")
+                            .clicked()
+                        {
+                            self.view = ViewState::FillOnNextFrame;
+                        }
+                        if ui
+                            .button("100%")
+                            .on_hover_text("Display at native pixel size (1)")
+                            .clicked()
+                        {
+                            self.view = ViewState::one_to_one();
+                        }
+                    });
+
+                    settings_row(ui, "Compare:", |ui| {
+                        self.show_compare_controls(ui);
+                    });
+
+                    settings_row(ui, "Image Grid:", |ui| {
+                        self.show_grid_controls(ui);
+                    });
+                });
+            });
+
+        // Annotation / markup.
+        egui::CollapsingHeader::new("Annotate")
+            .default_open(true)
+            .show(ui, |ui| {
+                grid("settings_annotate").show(ui, |ui| {
+                    settings_row(ui, "Annotate:", |ui| {
+                        ui.toggle_value(&mut self.annotating, "Enabled").on_hover_text(
+                            "Drag to paint over the image; strokes save to a sidecar PNG (A)",
+                        );
+                        if self.annotating {
+                            ui.color_edit_button_rgb(&mut self.brush_color);
+                            ui.add(
+                                egui::Slider::new(&mut self.brush_radius, 1.0..=200.0).text("px"),
+                            );
+                            ui.toggle_value(&mut self.erasing, "Erase");
+                            if ui
+                                .button("Clear")
+                                .on_hover_text("Remove all strokes and delete the sidecar PNG")
+                                .clicked()
+                            {
+                                self.remove_current_annotation();
+                            }
+                        }
+                    });
+                });
+            });
+
+        // Panels and window behavior.
+        egui::CollapsingHeader::new("Panels & Window")
+            .default_open(true)
+            .show(ui, |ui| {
+                grid("settings_panels").show(ui, |ui| {
+                    settings_row(ui, "Panels:", |ui| {
+                        ui.checkbox(&mut self.show_histogram, "Histogram")
+                            .on_hover_text("RGB + luminance histogram overlay");
+                        ui.checkbox(&mut self.show_exif, "EXIF")
+                            .on_hover_text("Camera, lens, and capture settings panel");
+                        ui.toggle_value(&mut self.show_color_panel, "Color...")
+                            .on_hover_text("Open palette + split-tone controls");
+                    });
+
+                    settings_row(ui, "Window:", |ui| {
+                        let prev_ref = self.reference_mode;
+                        ui.toggle_value(&mut self.reference_mode, "On top")
+                            .on_hover_text("Always-on-top + borderless (T)");
+                        if self.reference_mode != prev_ref {
+                            self.apply_reference_mode(ui.ctx());
+                        }
+                        ui.toggle_value(&mut self.compact, "Compact")
+                            .on_hover_text("Hide all panels - just the image (\\)");
+                    });
+
+                    settings_row(ui, "Pinboard:", |ui| {
+                        ui.toggle_value(&mut self.pinboard_mode, "Enabled")
+                            .on_hover_text("Moodboard canvas - drag, resize, arrange (P)");
+                        if self.pinboard_mode
+                            && ui
+                                .button("Pin selected")
+                                .on_hover_text("Add the current image to the pinboard (B)")
+                                .clicked()
+                        {
+                            self.pin_selected_to_board();
+                        }
+                    });
+                });
+            });
+
+        // File operations (Rename/Trash/Export) now live in the top File menu.
     }
 
     /// Quick-action icon bar at the top of the Settings window. Glyphs are the
@@ -2320,7 +2567,10 @@ impl TessellatorApp {
                     if self.compare_path.is_some() {
                         self.clear_compare();
                     } else if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                        .add_filter("Images", &[
+    "jpg", "jpeg", "png", "webp", "bmp", "tiff", "jp2", "j2k", "jpf", "jpx",
+    "j2c", "jpc",
+])
                         .pick_file()
                     {
                         self.start_compare(path, &ctx);
@@ -2331,7 +2581,10 @@ impl TessellatorApp {
                     if !self.grid_paths.is_empty() {
                         self.clear_grid();
                     } else if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                        .add_filter("Images", &[
+    "jpg", "jpeg", "png", "webp", "bmp", "tiff", "jp2", "j2k", "jpf", "jpx",
+    "j2c", "jpc",
+])
                         .pick_files()
                     {
                         let extras: Vec<PathBuf> = paths.into_iter().take(3).collect();
@@ -2432,7 +2685,10 @@ impl TessellatorApp {
         if self.grid_paths.is_empty() {
             if ui.button("Pick images...").clicked()
                 && let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                    .add_filter("Images", &[
+    "jpg", "jpeg", "png", "webp", "bmp", "tiff", "jp2", "j2k", "jpf", "jpx",
+    "j2c", "jpc",
+])
                     .pick_files()
             {
                 // The first picked image goes into the primary slot via
@@ -2462,7 +2718,10 @@ impl TessellatorApp {
                     .on_hover_text("Pick a second image to A/B compare")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Images", &["jpg", "jpeg", "png", "webp", "bmp", "tiff"])
+                        .add_filter("Images", &[
+    "jpg", "jpeg", "png", "webp", "bmp", "tiff", "jp2", "j2k", "jpf", "jpx",
+    "j2c", "jpc",
+])
                         .pick_file()
                 {
                     self.start_compare(path, ui.ctx());
@@ -2788,13 +3047,21 @@ impl TessellatorApp {
             if self.selected_index.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
-                        self.branding.show_launch_hero(ui);
-                        ui.add_space(12.0);
-                        ui.label(
-                            "Select an image to view, or use the arrow keys to navigate.",
-                        );
+                        if self.archive_loading {
+                            ui.add(egui::Spinner::new().size(48.0));
+                            ui.label("Opening comic...");
+                        } else {
+                            self.branding.show_launch_hero(ui);
+                            ui.add_space(12.0);
+                            ui.label(
+                                "Select an image to view, or use the arrow keys to navigate.",
+                            );
+                        }
                     });
                 });
+                if self.archive_loading {
+                    ui.ctx().request_repaint();
+                }
                 return;
             }
 

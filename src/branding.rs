@@ -4,11 +4,9 @@
 use eframe::egui;
 use std::sync::Arc;
 
-/// 1024x1024 app icon, used for the window/Dock/taskbar icon at runtime and as
-/// the source for the bundled macOS .icns.
+/// 1024x1024 app icon, used for the window/Dock/taskbar icon at runtime, the
+/// About window, and as the source for the bundled macOS .icns.
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app_icon.png");
-/// Full-bleed brand logo (cube cluster + wordmark) shown in the About window.
-const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
 /// Launch/hero art shown in the viewport before a folder or image is selected.
 const LAUNCH_SCREEN_PNG: &[u8] = include_bytes!("../assets/launch_screen.png");
 
@@ -28,9 +26,11 @@ const TOOLBAR_GLYPHS: [&[u8]; 10] = [
     include_bytes!("../assets/toolbar/glyph_9.png"),
 ];
 
-/// One-line description reused by the About window. Kept here so the wordmark,
-/// version, and tagline live in one place.
+/// One-line description shown in the About window.
 pub const TAGLINE: &str = "A high-definition photo viewer for artists";
+/// Copyright line shown in the About window (mirror of Info.plist's
+/// NSHumanReadableCopyright). Edit both together.
+pub const COPYRIGHT: &str = "Copyright © 2026 jsh";
 
 /// Decode an embedded PNG to premultiplied-free RGBA8 plus its dimensions.
 /// Panics only on a corrupt embedded asset, which is a build-time mistake.
@@ -62,7 +62,7 @@ fn color_image(bytes: &[u8]) -> egui::ColorImage {
 /// egui context exists, so they're created on first use and cached.
 #[derive(Default)]
 pub struct Branding {
-    logo: Option<egui::TextureHandle>,
+    icon: Option<egui::TextureHandle>,
     launch: Option<egui::TextureHandle>,
     toolbar: [Option<egui::TextureHandle>; 10],
     /// Whether the About window is currently shown.
@@ -70,12 +70,12 @@ pub struct Branding {
 }
 
 impl Branding {
-    fn logo_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
-        self.logo
+    fn icon_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        self.icon
             .get_or_insert_with(|| {
                 ctx.load_texture(
-                    "brand_logo",
-                    color_image(LOGO_PNG),
+                    "brand_icon",
+                    color_image(APP_ICON_PNG),
                     egui::TextureOptions::LINEAR,
                 )
             })
@@ -128,7 +128,7 @@ impl Branding {
         if !self.about_open {
             return;
         }
-        let logo = self.logo_texture(ctx);
+        let icon = self.icon_texture(ctx);
         let mut open = self.about_open;
         let mut close_clicked = false;
         egui::Window::new("About Tessellator")
@@ -141,10 +141,10 @@ impl Branding {
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
                     ui.add(
-                        egui::Image::new(&logo)
-                            .fit_to_exact_size(egui::vec2(360.0, 360.0)),
+                        egui::Image::new(&icon)
+                            .fit_to_exact_size(egui::vec2(160.0, 160.0)),
                     );
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new("Tessellator")
                             .heading()
@@ -160,6 +160,8 @@ impl Branding {
                     );
                     ui.add_space(6.0);
                     ui.label(TAGLINE);
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(COPYRIGHT).weak().small());
                     ui.add_space(12.0);
                     if ui.button("Close").clicked() {
                         close_clicked = true;
