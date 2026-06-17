@@ -14,11 +14,13 @@ non-trivial.
 - Build: `cargo build` (release: `cargo build --release`)
 - Run: `cargo run` (use `RUST_LOG=debug cargo run` to see decode/cache/watcher logs)
 - Check / lint: `cargo check`, `cargo clippy --no-deps`
-- No tests yet; `cargo test` is a no-op.
+- Test: `cargo test` (unit tests live in `#[cfg(test)] mod tests` inside the modules they cover).
+- Verify unsafe + cache invariants under Miri: `cargo +nightly miri test`.
+- Fuzz (requires `cargo install cargo-fuzz` + nightly): `cd fuzz && cargo +nightly fuzz run is_jp2`.
 
 Rust edition is `2024`, so a recent stable toolchain is required.
 
-**Performance note**: image decode + mipmap generation is much slower in debug builds. For realistic feel use `cargo run --release`.
+**Performance note**: image decode is much slower in debug builds. For realistic feel use `cargo run --release`.
 
 ## Architecture
 
@@ -28,7 +30,7 @@ Tessellator is a single-binary photo viewer for artists, built on `eframe`/`egui
 src/
   main.rs       Entry point; eframe NativeOptions; module declarations.
   app.rs        TessellatorApp + update loop. The bulk of UI logic.
-  io.rs         Background I/O: folder scan, image decode, mip generation.
+  io.rs         Background I/O: folder scan, image decode, EXIF rotate.
   cache.rs      LRU cache of DecodedImage keyed by path, capped by bytes.
   view.rs       ViewState enum + view_matrix helper.
   watcher.rs    notify wrapper that fires Message::FolderChanged.
@@ -42,7 +44,7 @@ src/
 ### Threading model
 
 - **UI thread** drives `App::update()` and reads from a `crossbeam_channel::Receiver<Message>`.
-- **Rayon pool** does all CPU-heavy image work: file read, decode, EXIF rotate, RGBA convert, mip chain generation. Each result is sent back as a `Message`. Mip generation itself uses rayon's row-level parallelism for the larger mip levels.
+- **Rayon pool** does all CPU-heavy image work: file read, decode, EXIF rotate, RGBA convert. Each result is sent back as a `Message`. Mipmaps are generated on the GPU.
 - **One-off `std::thread`** for folder scanning (I/O-bound, doesn't deserve a Rayon worker).
 - **notify watcher thread** owned by `FolderWatcher`. Sends `Message::FolderChanged` and is dropped when the folder changes.
 - **Render thread** (egui_wgpu's) runs `TessellatorCallback::prepare` and `paint`. The decision to do all CPU prep on the worker (not in `prepare`) is load-bearing — see "High-res upload path" below.
@@ -77,16 +79,7 @@ Flow in `app.rs`: `open_path_list` routes archives to `open_archive`, which extr
 
 ### High-res upload path
 
-CPU prep is concentrated in the decode worker. `io::decode_image_with_mips` produces a `DecodedImage { width, height, mips: Vec<MipLevel> }` where each `MipLevel` is raw RGBA bytes ready for `queue.write_texture`. The render thread does almost no CPU work — just iterating mips and uploading. **Do not move mip generation back into `TessellatorResources::set_main_texture`**; that's what made the viewer feel sluggish before this change.
-
-### Mip generation (SWAR + SIMD + rayon)
-
-`io::downsample_box` does a 2x2 box filter on RGBA8 with three layers of speedup:
-1. **SWAR averaging** per `u32` pixel: the `0x00FF00FF` mask trick splits R/B from G/A into separate u16 lanes within one u32 so 4-channel averaging is one mask + add + shift, no per-byte loop. Max sum (4 × 255 = 1020) fits in 10 bits, no carry into adjacent lanes.
-2. **SIMD via `wide::u32x8`**: 8 output pixels per batch. Manual deinterleave (no shuffle in `wide`) into even/odd vectors. Compiler typically lowers to a few NEON/AVX shuffles.
-3. **Rayon row parallelism** for output mips ≥ 256×256. Below that, dispatch overhead exceeds the work — runs sequentially.
-
-`bytemuck::cast_slice` reinterprets row bytes as `&[u32]` without copying. Alignment is guaranteed by Vec's allocator + 4-byte stride.
+CPU prep is concentrated in the decode worker. `io::decode_image*` produces a `DecodedImage` whose `rgba: Vec<u8>` is ready for `queue.write_texture`. The render thread does almost no CPU work; mipmaps are generated on the GPU by the wgpu pipeline. **Do not move mip generation into `TessellatorResources::set_main_texture`** unless you have measurements showing GPU-side generation is the bottleneck.
 
 ### Zero-copy RGBA
 
@@ -105,7 +98,7 @@ The Display path:
 
 ### LRU image cache
 
-`ImageCache` (in `cache.rs`) holds `Arc<DecodedImage>` keyed by path. Capped at 512 MB by summing each image's mip-chain bytes. `get` is mark-LRU (promotes to front). The most-recently-used entry is never evicted, so a single huge image still displays.
+`ImageCache` (in `cache.rs`) holds `Arc<DecodedImage>` keyed by path. Capped at 512 MB by summing each image's `rgba` length (`DecodedImage::byte_size`). `get` is mark-LRU (promotes to front). The most-recently-used entry is never evicted, so a single huge image still displays. Invariants (bytes-accounting matches stored entries, no duplicate paths, over-cap only allowed when one MRU entry alone exceeds the cap) are checked by a model-based proptest in `cache.rs`.
 
 Used for two things:
 - **Neighbor preload**: `select_image` fires Preload requests for N-1 and N+1.

@@ -38,6 +38,11 @@ trash = "5"
 jpeg2k = { version = "0.10", default-features = false, features = ["openjp2", "image"] }
 zip = { version = "2", default-features = false, features = ["deflate", "bzip2"] }
 unrar = "0.5"
+creusot-std = "0.12.0-dev"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
 
 # Menu-bar (system tray) presence. macOS-only on purpose: the Menu Bar Icon
 # asset is a macOS-style template, and gating to macOS avoids pulling the

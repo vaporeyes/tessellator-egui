@@ -239,7 +239,7 @@ fn is_jpeg(bytes: &[u8]) -> bool {
 /// JPEG 2000 detection by magic bytes: the JP2/JPX/JPM signature box, or a
 /// raw J2K codestream. The `image` crate decodes neither, so these route to
 /// the jpeg2k decoder (pure-Rust openjp2 backend) instead.
-fn is_jp2(bytes: &[u8]) -> bool {
+pub fn is_jp2(bytes: &[u8]) -> bool {
     // JP2 family signature box: length 0x0C, type "jP  ", then the 0D 0A 87 0A
     // marker. Covers .jp2/.jpx/.jpf/.jpm containers.
     const JP2_SIGNATURE: &[u8] = &[
@@ -1026,6 +1026,38 @@ mod tests {
         assert!(!is_jp2(&[0xFF, 0xD8, 0xFF, 0xE0]), "JPEG should not match");
         assert!(!is_jp2(&[0x89, 0x50, 0x4E, 0x47]), "PNG should not match");
         assert!(!is_jp2(&[]), "empty");
+    }
+
+    #[test]
+    fn read_file_bytes_small_file_uses_heap() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let payload = b"hello world";
+        f.write_all(payload).unwrap();
+        let fb = read_file_bytes(f.path()).unwrap();
+        assert!(matches!(fb, FileBytes::Heap(_)), "small files must be heap-read");
+        assert_eq!(fb.as_slice(), payload);
+    }
+
+    #[test]
+    fn read_file_bytes_empty_file() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let fb = read_file_bytes(f.path()).unwrap();
+        assert_eq!(fb.as_slice().len(), 0);
+    }
+
+    #[test]
+    fn read_file_bytes_large_file_round_trips() {
+        // > MMAP_MIN_BYTES so the mmap branch is exercised on platforms
+        // where mmap succeeds. Either branch must return the right bytes.
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let payload = vec![0xABu8; (MMAP_MIN_BYTES as usize) + 1024];
+        f.write_all(&payload).unwrap();
+        let fb = read_file_bytes(f.path()).unwrap();
+        assert_eq!(fb.as_slice().len(), payload.len());
+        assert_eq!(fb.as_slice()[0], 0xAB);
+        assert_eq!(*fb.as_slice().last().unwrap(), 0xAB);
     }
 
     #[test]
